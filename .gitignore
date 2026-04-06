@@ -1,0 +1,68 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environment
+venv/
+ENV/
+env/
+.venv
+
+# Cache
+.cache/
+.pytest_cache/
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Data (local)
+*.csv.bak
+*.pickle
+*.pkl
+
+# Temporary
+/tmp/
+temp/
+*.tmp
+test_data.csv
+test_validation*.csv
+
+# Output
+/output/
+*.log
