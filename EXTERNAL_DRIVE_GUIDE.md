@@ -186,8 +186,8 @@ chmod -R u+rwx /Volumes/ChouSSD/elder_datasets/
 **最有效的解决方案（推荐）：**
 
 ```bash
-# 1. 杀掉 Spotlight daemon 进程
-sudo killall -9 managedcorespotlightd
+# 1. 关闭外接盘的 Spotlight
+sudo mdutil -i off /Volumes/ChouSSD
 
 # 2. 然后再尝试卸载
 diskutil eject ChouSSD
