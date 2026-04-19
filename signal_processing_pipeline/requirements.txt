@@ -1,6 +1,7 @@
 numpy>=1.20.0
 scipy>=1.6.0
 pandas>=1.2.0
+scikit-fuzzy>=0.4.2
 scikit-signal>=0.17.0
 matplotlib>=3.3.0
 wfdb>=3.4.0

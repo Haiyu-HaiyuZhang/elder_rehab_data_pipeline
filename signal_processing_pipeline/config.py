@@ -38,7 +38,7 @@ PEAK_HEIGHT_MULTIPLIER = 2.5
 # 步频范围（Hz）
 # 原值 0.5-3.0 过宽且上限过高
 # 改为 0.8-2.5，符合老年人和健康人的实际步频范围
-STEP_FREQUENCY_MIN_HZ = 0.8
+STEP_FREQUENCY_MIN_HZ = 0.5
 STEP_FREQUENCY_MAX_HZ = 2.5
 
 # ============================================================
