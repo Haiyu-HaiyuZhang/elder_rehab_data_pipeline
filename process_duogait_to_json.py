@@ -375,8 +375,12 @@ class DUOGAITProcessor:
         
         timestamp = session_time.isoformat() + "Z"
         
+        # Format window_id for consistency
+        formatted_window_id = f"window_ST_{window_id:03d}"
+        
         window_json = {
             "metadata": {
+                "window_id": formatted_window_id,
                 "session_id": f"session_{self.subject_id}_st",
                 "player_id": self.subject_id,
                 "timestamp": timestamp,
@@ -539,7 +543,7 @@ def main():
     raw_data_dir = '/Volumes/ChouSSD/elder_datasets/DUO-GAIT/raw/OG_st_raw/sub_01'
     output_dir = '/Volumes/ChouSSD/elder_datasets/DUO-GAIT/json/'
     subject_id = 'sub_01'
-    max_windows = 5  # Process only 5 windows for testing
+    max_windows = None  # Process all windows
     
     print("=" * 70)
     print("DUO-GAIT Data Processor - JSON Window Export")
@@ -548,7 +552,7 @@ def main():
     print(f"Input: {raw_data_dir}")
     print(f"Output: {output_dir}")
     print(f"Window duration: 30 seconds")
-    print(f"Max windows: {max_windows} (for small batch test)")
+    print(f"Processing: ALL data (complete subject dataset)")
     print("=" * 70)
     
     processor = DUOGAITProcessor(raw_data_dir, output_dir, subject_id)
