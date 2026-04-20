@@ -35,40 +35,142 @@ class DUOGAITProcessor:
         self.hr_data = None
         self.st_sample_rate = None
         self.hr_sample_rate = None
+        self.hr_start_offset = 0  # Offset in seconds for HR data alignment
+        
+    def _align_interim_to_raw(self):
+        """
+        Find which part of raw HR data corresponds to interim IMU data.
+        Uses signal feature matching to locate the interim data within raw.
+        
+        Returns: start_offset (in seconds) of HR data that corresponds to interim IMU
+        """
+        print(f"\n  🔍 Aligning interim IMU ({len(self.st_data)} rows) to raw HR...")
+        
+        # Load interim IMU signature (use acceleration magnitude)
+        interim_accel_cols = [col for col in self.st_data.columns if col.startswith('Acc')]
+        if len(interim_accel_cols) < 3:
+            print(f"    ⚠ Only {len(interim_accel_cols)} accel columns found (need 3), using default offset")
+            return 0
+        
+        interim_ax = pd.to_numeric(self.st_data[interim_accel_cols[0]], errors='coerce').values
+        interim_ay = pd.to_numeric(self.st_data[interim_accel_cols[1]], errors='coerce').values
+        interim_az = pd.to_numeric(self.st_data[interim_accel_cols[2]], errors='coerce').values
+        
+        # Calculate acceleration magnitude for interim
+        interim_valid = ~(np.isnan(interim_ax) | np.isnan(interim_ay) | np.isnan(interim_az))
+        interim_accel_mag = np.sqrt(interim_ax**2 + interim_ay**2 + interim_az**2)
+        interim_accel_mag = interim_accel_mag[interim_valid]
+        
+        # Create signature: mean and std of acceleration in windows
+        interim_sig = self._compute_signature(interim_accel_mag, window_size=60)  # 0.5 sec windows
+        interim_sig_len = len(interim_sig)
+        
+        print(f"    Interim signature length: {interim_sig_len}")
+        
+        # Load raw IMU to find matching signature
+        raw_st_file = os.path.join(self.hr_data_dir, 'ST.csv')
+        if not os.path.exists(raw_st_file):
+            print(f"    ⚠ Raw ST file not found at {raw_st_file}, using first available HR data")
+            return 0
+        
+        print(f"    Loading raw ST data for matching...")
+        raw_st = pd.read_csv(raw_st_file, skiprows=[0, 1, 2, 3], header=1)  # Skip first 4 rows, use row 1 (5th row overall) as header
+        
+        # Convert to numeric
+        for col in raw_st.columns:
+            raw_st[col] = pd.to_numeric(raw_st[col], errors='coerce')
+        
+        # Extract raw acceleration
+        raw_accel_cols = [col for col in raw_st.columns if 'Accel' in col]
+        if len(raw_accel_cols) < 3:
+            print(f"    ⚠ Raw data has only {len(raw_accel_cols)} accel columns")
+            return 0
+        
+        raw_ax = pd.to_numeric(raw_st[raw_accel_cols[0]], errors='coerce').values
+        raw_ay = pd.to_numeric(raw_st[raw_accel_cols[1]], errors='coerce').values
+        raw_az = pd.to_numeric(raw_st[raw_accel_cols[2]], errors='coerce').values
+        
+        raw_valid = ~(np.isnan(raw_ax) | np.isnan(raw_ay) | np.isnan(raw_az))
+        raw_accel_mag = np.sqrt(raw_ax**2 + raw_ay**2 + raw_az**2)
+        raw_accel_mag = raw_accel_mag[raw_valid]
+        
+        print(f"    Raw data length: {len(raw_accel_mag)} samples (~{len(raw_accel_mag)/128/60:.1f} min)")
+        
+        # Compute signature for raw with sliding window
+        best_offset = 0
+        best_score = float('inf')
+        
+        # Search in raw data with stride to speed up
+        stride = 128 * 10  # ~10 sec stride at 128 Hz
+        search_size = min(len(raw_accel_mag) // 2, 128 * 60 * 20)  # Search first 20 minutes
+        
+        print(f"    Searching for match in first {search_size // 128 / 60:.1f} minutes...")
+        
+        for start_idx in range(0, search_size, stride):
+            end_idx = min(start_idx + len(interim_accel_mag), len(raw_accel_mag))
+            if end_idx - start_idx < len(interim_accel_mag) * 0.8:
+                continue
+            
+            raw_segment = raw_accel_mag[start_idx:end_idx]
+            raw_sig = self._compute_signature(raw_segment, window_size=60)
+            
+            if len(raw_sig) < interim_sig_len * 0.5:
+                continue
+            
+            # Compare signatures using DTW-like distance
+            score = self._compare_signatures(interim_sig, raw_sig)
+            
+            if score < best_score:
+                best_score = score
+                best_offset = start_idx / 128  # Convert to seconds
+                best_found_idx = start_idx
+        
+        print(f"    Best match found at offset: {best_offset:.1f} sec (score: {best_score:.3f})")
+        self.hr_start_offset = int(best_offset)
+        
+        return int(best_offset)
+    
+    def _compute_signature(self, data, window_size=60):
+        """Compute signature as statistics over sliding windows"""
+        sig = []
+        for i in range(0, len(data), window_size):
+            window = data[i:i+window_size]
+            if len(window) > 10:
+                sig.append(np.std(window))  # Use standard deviation as signature
+        return np.array(sig)
+    
+    def _compare_signatures(self, sig1, sig2):
+        """Compare two signatures using normalized distance"""
+        if len(sig1) == 0 or len(sig2) == 0:
+            return float('inf')
+        
+        # Ensure sig2 is longer
+        if len(sig2) < len(sig1):
+            return float('inf')
+        
+        # Compute sliding window distance
+        min_dist = float('inf')
+        for offset in range(len(sig2) - len(sig1) + 1):
+            dist = np.sqrt(np.mean((sig1 - sig2[offset:offset+len(sig1)])**2))
+            min_dist = min(min_dist, dist)
+        
+        return min_dist
         
     def load_data(self):
         """Load IMU and heart rate data"""
         print(f"Loading IMU data from {self.imu_data_dir}...")
         print(f"Loading HR data from {self.hr_data_dir}...")
         
-        # Load ST (gait) data from INTERIM - skip metadata lines (0-3)
+        # Load ST (gait) data from INTERIM - first row contains column headers
         st_file = os.path.join(self.imu_data_dir, 'ST.csv')
-        st_raw = pd.read_csv(st_file, skiprows=[0, 1, 2, 3], low_memory=False)
+        self.st_data = pd.read_csv(st_file, index_col=0)  # First column is row index, skip it
         
-        # Extract proper column names from the first two rows (which become rows 0-1 after skiprows)
-        col_names = []
-        for i, col in enumerate(st_raw.columns):
-            # Get name from row 0 (column header)
-            val0 = str(st_raw.iloc[0, i]).strip() if pd.notna(st_raw.iloc[0, i]) else ''
-            val1 = str(st_raw.iloc[1, i]).strip() if pd.notna(st_raw.iloc[1, i]) else ''
-            
-            if val0 and val0 != 'nan' and val0 != '':
-                col_names.append(val0)
-            elif val1 and val1 != 'nan' and val1 != '':
-                col_names.append(val1)
-            else:
-                col_names.append(f'Col_{i}')
-        
-        st_raw.columns = col_names
-        self.st_data = st_raw.iloc[2:].copy()  # Skip first 2 rows (which are header info)
-        self.st_data.reset_index(drop=True, inplace=True)
-        
-        # Convert to numeric
+        # Convert all columns to numeric
         for col in self.st_data.columns:
             self.st_data[col] = pd.to_numeric(self.st_data[col], errors='coerce')
         
         print(f"  ✓ Loaded ST data: {len(self.st_data)} rows")
-        print(f"    Columns: {list(self.st_data.columns[:8])}")
+        print(f"    Columns: {list(self.st_data.columns)}")
         
         # Load heart rate data from RAW
         hr_file = os.path.join(self.hr_data_dir, 'heart_rate.CSV')
@@ -93,6 +195,9 @@ class DUOGAITProcessor:
                     self.hr_sample_rate = np.median(1.0 / valid_diffs.values)
                     print(f"  ✓ HR sample rate: {self.hr_sample_rate:.2f} Hz")
         
+        # Align interim IMU data to raw HR data
+        self._align_interim_to_raw()
+        
         return True
     
     def extract_gait_features(self, accel_data, gyro_data, time_data):
@@ -112,7 +217,7 @@ class DUOGAITProcessor:
         try:
             # Find acceleration columns (flexible column naming)
             accel_cols = [col for col in accel_data.columns 
-                         if 'ccel' in col.lower()]  # Matches Accel, accel, AccelX, etc
+                         if col.startswith('Acc')]  # Matches AccX, AccY, AccZ
             
             if len(accel_cols) >= 3:
                 ax = pd.to_numeric(accel_data[accel_cols[0]], errors='coerce').values
@@ -454,29 +559,33 @@ class DUOGAITProcessor:
             # Extract data for this window
             st_window = self.st_data.iloc[start_idx:end_idx]
             
-            # Find corresponding HR data
-            st_start_time = st_time[start_idx]
-            st_end_time = st_time[min(end_idx, len(st_time)-1)]
+            # Calculate time for this window (in seconds from ST start)
+            window_start_sec = start_idx / (self.st_sample_rate or 128)
+            window_end_sec = end_idx / (self.st_sample_rate or 128)
+            
+            # Convert to HR time using the alignment offset
+            # HR data was aligned to start at hr_start_offset seconds
+            hr_window_start = window_start_sec + self.hr_start_offset
+            hr_window_end = window_end_sec + self.hr_start_offset
             
             # Sync HR data if available
-            if self.hr_data is not None and 'Elapsed Time (sec)' in self.hr_data.columns:
-                hr_time = self.hr_data['Elapsed Time (sec)'].values
-                # Find HR indices in this time window (with some tolerance)
-                max_time_diff = 5  # seconds tolerance
-                hr_mask = (np.abs(hr_time - st_start_time) < max_time_diff) | \
-                         (np.abs(hr_time - st_end_time) < max_time_diff)
+            if self.hr_data is not None and 'HR (bpm)' in self.hr_data.columns:
+                # Extract HR data for this time window
+                # HR is 1 Hz (1 sample per second), so indices correspond to seconds
+                hr_start_idx = max(0, int(hr_window_start))
+                hr_end_idx = min(len(self.hr_data), int(hr_window_end) + 1)
+                hr_window = self.hr_data.iloc[hr_start_idx:hr_end_idx]
+            elif self.hr_data is not None and 'Elapsed Time (sec)' in self.hr_data.columns:
+                # Fallback: use time-based matching
+                hr_time = pd.to_numeric(self.hr_data['Elapsed Time (sec)'], errors='coerce').values
+                hr_mask = (hr_time >= hr_window_start - 1) & (hr_time <= hr_window_end + 1)
                 hr_window = self.hr_data[hr_mask]
-                
-                if len(hr_window) == 0:
-                    # Try to find any HR data close to this window
-                    closest_idx = np.argmin(np.abs(hr_time - st_start_time))
-                    hr_window = self.hr_data.iloc[max(0, closest_idx-50):min(len(self.hr_data), closest_idx+50)]
             else:
-                hr_window = self.hr_data.iloc[:min(100, len(self.hr_data))] if self.hr_data is not None else pd.DataFrame()
+                hr_window = pd.DataFrame()
             
             # Extract features
-            accel_data = st_window[['Accel X', 'Accel Y', 'Accel Z']] if all(col in st_window.columns for col in ['Accel X', 'Accel Y', 'Accel Z']) else st_window
-            gyro_data = st_window[['Gyro X', 'Gyro Y', 'Gyro Z']] if all(col in st_window.columns for col in ['Gyro X', 'Gyro Y', 'Gyro Z']) else st_window
+            accel_data = st_window[['AccX', 'AccY', 'AccZ']] if all(col in st_window.columns for col in ['AccX', 'AccY', 'AccZ']) else st_window
+            gyro_data = st_window[['GyrX', 'GyrY', 'GyrZ']] if all(col in st_window.columns for col in ['GyrX', 'GyrY', 'GyrZ']) else st_window
             
             gait_features = self.extract_gait_features(accel_data, gyro_data, st_time[start_idx:end_idx])
             
