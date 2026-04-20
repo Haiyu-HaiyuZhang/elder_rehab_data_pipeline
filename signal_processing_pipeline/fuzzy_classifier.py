@@ -39,6 +39,12 @@ class FuzzyExerciseClassifier:
         """
         self.age = age
         self.mhr = 220 - age
+        # LLM 规则阈值 - IMU 绝对评分标准
+        self.llm_rules = {
+            'cadence_hz': {'good': (1.6, 2.0), 'degraded_low': (1.4, 1.6), 'degraded_high': (2.0, 2.2)},
+            'stride_m': {'good': (0.45, 0.65), 'degraded_low': (0.35, 0.45), 'degraded_high': (0.65, 0.75)},
+            'step_var_ms': {'good': 30, 'degraded': 60}
+        }
     
     # ============================================================
     # 隶属度函数 (Membership Functions)
@@ -108,9 +114,10 @@ class FuzzyExerciseClassifier:
         
         return {'light': light, 'moderate': moderate, 'heavy': heavy}
     
-    def classify(self, hr_mean, step_var, hr_recovery, stride_length, rpe_score=12):
+    def classify(self, hr_mean, step_var, hr_recovery, stride_length, rpe_score=12,
+                 cadence_hz=None, imu_quality=0.85, hr_quality=0.85):
         """
-        对单个 30s 窗口进行分类
+        对单个 30s 窗口进行分类（对齐 LLM 规则）
         
         Args:
             hr_mean (float): 平均心率 (bpm)
@@ -118,13 +125,17 @@ class FuzzyExerciseClassifier:
             hr_recovery (float): 心率恢复速率 (bpm/min)
             stride_length (float): 平均步长 (m)
             rpe_score (float): 主观感觉费力程度 (Borg 6-20)，默认 12（中等）
+            cadence_hz (float): 步频 (Hz)，用于 Dim 3 movement quality - 必需
+            imu_quality (float): IMU 数据质量 (0-1)，<0.6 时降权
+            hr_quality (float): HR 数据质量 (0-1)，<0.6 时降权
         
         Returns:
             dict: {
                 'exercise_load': (value, category),
                 'fatigue_level': (value, category),
                 'movement_quality': (value, category),
-                'confidence': float (0-1, 基于输出隶属度)
+                'confidence': float (0-1, 基于输出隶属度 + 数据质量),
+                'data_quality_flags': dict (imu_quality, hr_quality)
             }
         """
         
@@ -214,10 +225,22 @@ class FuzzyExerciseClassifier:
         # 映射到分类标签
         load_category = self._categorize_load(load_value)
         fatigue_category = self._categorize_fatigue(fatigue_value)
-        quality_category = self._categorize_quality(quality_value)
         
-        # 计算置信度
-        confidence = self._calculate_confidence(hr_mean, step_var)
+        # 使用新的规则-based质量分类方法（包含 Cadence）
+        quality_category = self._categorize_quality_by_rules(
+            cadence_hz=cadence_hz if cadence_hz is not None else 1.8,
+            stride_length=stride_length,
+            step_var=step_var
+        )
+        
+        # 数据质量检查：如果两个来源都低质，标记为无效
+        if imu_quality < 0.6 and hr_quality < 0.6:
+            quality_category = 'unknown'
+            fatigue_category = 'unknown'
+            load_category = 'unknown'
+        
+        # 计算置信度（考虑数据质量）
+        confidence = self._calculate_confidence(hr_mean, step_var, imu_quality, hr_quality)
         
         return {
             'exercise_load': (load_value, load_category),
@@ -255,7 +278,7 @@ class FuzzyExerciseClassifier:
     
     @staticmethod
     def _categorize_quality(value):
-        """将连续输出值映射到质量分类"""
+        """将连续输出值映射到质量分类（已弃用，使用新的规则）"""
         if value < 0.67:
             return 'good'
         elif value < 1.33:
@@ -263,12 +286,91 @@ class FuzzyExerciseClassifier:
         else:
             return 'poor'
     
-    def _calculate_confidence(self, hr_mean, step_var):
+    def _categorize_quality_by_rules(self, cadence_hz, stride_length, step_var):
         """
-        计算分类置信度（相对于参考范围的偏离度）
+        基于 LLM 规则的动作质量分类（Dim 3 - Movement Quality）
+        
+        LLM 规则标准：
+          Cadence (Hz):       good [1.6, 2.0] | degraded [1.4, 1.6) or (2.0, 2.2] | poor <1.4 or >2.2
+          Stride length (m):  good [0.45, 0.65] | degraded [0.35, 0.45) or (0.65, 0.75] | poor <0.35 or >0.75
+          Step-time var (ms): good <30 | degraded 30–60 | poor >60
+        
+        分类规则：
+          1. Score each IMU metric: good=0, degraded=1, poor=2
+          2. Sum ≤1 → good; sum 2–3 → degraded; sum ≥4 → poor
+          3. Extreme override: var >80ms OR stride <0.30m → poor regardless of sum
+          4. Combination override: var >60 AND stride <0.35 → poor
+        
+        Args:
+            cadence_hz: Cadence/Step frequency (Hz)
+            stride_length: Stride length (m)
+            step_var: Step time variability (ms)
+        
+        Returns:
+            quality_category: 'good' or 'degraded' or 'poor' or 'unknown'
+        """
+        # Handle missing cadence
+        if cadence_hz is None:
+            cadence_hz = 1.8  # default
+        
+        # 1. 对每个指标评分（根据 LLM 规则）
+        
+        # Cadence scoring
+        if 1.6 <= cadence_hz <= 2.0:
+            cadence_score = 0  # good
+        elif (1.4 <= cadence_hz < 1.6) or (2.0 < cadence_hz <= 2.2):
+            cadence_score = 1  # degraded
+        elif cadence_hz < 1.4 or cadence_hz > 2.2:
+            cadence_score = 2  # poor
+        else:
+            cadence_score = 1  # fallback
+        
+        # Stride length scoring
+        if 0.45 <= stride_length <= 0.65:
+            stride_score = 0  # good
+        elif (0.35 <= stride_length < 0.45) or (0.65 < stride_length <= 0.75):
+            stride_score = 1  # degraded
+        elif stride_length < 0.35 or stride_length > 0.75:
+            stride_score = 2  # poor
+        else:
+            stride_score = 1  # fallback
+        
+        # Step variability scoring (LLM: good <30, degraded 30-60, poor >60)
+        if step_var < 30:
+            var_score = 0  # good
+        elif 30 <= step_var <= 60:
+            var_score = 1  # degraded
+        else:  # >60
+            var_score = 2  # poor
+        
+        # 2. 计算求和
+        quality_sum = cadence_score + stride_score + var_score
+        
+        # 3. 应用基础规则
+        if quality_sum <= 1:
+            base_quality = 'good'
+        elif quality_sum <= 3:
+            base_quality = 'degraded'
+        else:  # ≥4
+            base_quality = 'poor'
+        
+        # 4. 极端情况 override（优先级最高）
+        if step_var > 80 or stride_length < 0.30:
+            return 'poor'
+        
+        # 5. 组合情况 override
+        if step_var > 60 and stride_length < 0.35:
+            return 'poor'
+        
+        return base_quality
+    
+    def _calculate_confidence(self, hr_mean, step_var, imu_quality=0.85, hr_quality=0.85):
+        """
+        计算分类置信度（相对于参考范围的偏离度 + 数据质量权重）
         
         - HR 在最优范围内 → 高置信度
         - 步伐变异在正常范围 → 高置信度
+        - 数据质量低 → 降低置信度
         """
         # HR 置信度：偏离 60-80% MHR 越远，置信度越低
         hr_optimal_low = 0.60 * self.mhr
@@ -289,8 +391,13 @@ class FuzzyExerciseClassifier:
         else:
             step_confidence = max(0.6, 1.0 - (step_var - 60) / 90)
         
-        # 综合置信度
-        return (hr_confidence + step_confidence) / 2.0
+        # 数据质量权重：<0.6 时严重降权
+        imu_weight = 1.0 if imu_quality >= 0.6 else 0.5
+        hr_weight = 1.0 if hr_quality >= 0.6 else 0.5
+        quality_factor = (imu_weight + hr_weight) / 2.0
+        
+        # 综合置信度（包含质量因子）
+        return ((hr_confidence + step_confidence) / 2.0) * quality_factor
     
     def _generate_reasoning(self, hr_mean, step_var, hr_recovery, stride_length, rpe_score):
         """

@@ -25,6 +25,22 @@ import pandas as pd
 from fuzzy_classifier import FuzzyExerciseClassifier
 
 
+def get_subject_age_from_info(subject_id):
+    """从 subject_info.csv 读取受试者年龄"""
+    try:
+        subject_info_path = '/Volumes/ChouSSD/elder_datasets/DUO-GAIT/raw/subject_info.csv'
+        info_df = pd.read_csv(subject_info_path)
+        
+        subject_row = info_df[info_df['sub'] == subject_id]
+        if not subject_row.empty:
+            age = subject_row['age'].values[0]
+            return int(age)
+    except:
+        pass
+    
+    return None
+
+
 class FuzzyValidationEngine:
     """模糊逻辑验证引擎"""
     
@@ -43,10 +59,10 @@ class FuzzyValidationEngine:
     
     def validate_single_window(self, window_json: Dict) -> Dict:
         """
-        对单个窗口应用模糊分类
+        对单个窗口应用模糊分类（对齐 LLM 规则）
         
         Args:
-            window_json: 窗口 JSON 字典
+            window_json: 窗口 JSON 字典（结构：metadata, imu, heart_rate）
         
         Returns:
             分类结果字典
@@ -55,44 +71,48 @@ class FuzzyValidationEngine:
         # 提取元数据
         metadata = window_json.get('metadata', {})
         window_id = metadata.get('window_id', 'unknown')
+        subject_id = metadata.get('player_id', 'unknown')
+        session_id = metadata.get('session_id', 'unknown')
+        # 从 session_id 提取 task_type（如 "st"、"control" 等）
+        task_type = session_id.split('_')[-1] if session_id != 'unknown' else 'unknown'
         
-        # 提取特征
-        raw_features = window_json.get('raw_feature_values', {})
+        # 提取 IMU 特征（新的 JSON 结构）
+        imu = window_json.get('imu', {})
+        imu_features = imu.get('features', {})
         
-        if not raw_features:
-            # 备选：从 gait_features 和 heart_rate 提取
-            gait = window_json.get('gait_features', {})
-            hr = window_json.get('heart_rate', {})
-            
-            raw_features = {
-                'hr_mean': hr.get('mean_bpm', 0),
-                'step_var': gait.get('step_variability_ms', 0),
-                'hr_recovery': hr.get('recovery_bpm_per_min', 0),
-                'stride_length': gait.get('stride_length_m', 0),
-                'rpe_score': window_json.get('subjective_assessment', {}).get('rpe_score', 12)
-            }
+        cadence_hz = float(imu_features.get('step_frequency_hz', 1.8))
+        stride_length = float(imu_features.get('step_length_m', 0.5))
+        step_var = float(imu_features.get('step_time_variability_ms', 45))
+        imu_quality = float(imu.get('data_quality', 0.85))
+        
+        # 提取心率特征
+        heart_rate = window_json.get('heart_rate', {})
+        hr_features = heart_rate.get('features', {})
+        
+        hr_mean = float(hr_features.get('hr_mean_bpm', 80))
+        hr_recovery = float(hr_features.get('hr_recovery_bpm_per_min', 10))
+        hr_quality = float(heart_rate.get('data_quality', 0.85))
+        
+        # RPE 如果有的话
+        rpe_score = float(window_json.get('rpe_score', 12))
         
         # 数据验证和范围检查
-        hr_mean = float(raw_features.get('hr_mean', 0))
-        step_var = float(raw_features.get('step_var', 0))
-        hr_recovery = float(raw_features.get('hr_recovery', 0))
-        stride_length = float(raw_features.get('stride_length', 0))
-        rpe_score = float(raw_features.get('rpe_score', 12))
-        
-        # 验证数据质量
         if hr_mean < 40 or hr_mean > 180:
             logger_msg = f"⚠️  窗口 {window_id}: HR 异常 ({hr_mean:.0f} bpm)"
             if self.verbose:
                 print(logger_msg)
         
-        # 应用模糊分类
+        # 应用模糊分类（传入所有必需参数）
         try:
             classification = self.classifier.classify(
                 hr_mean=hr_mean,
                 step_var=step_var,
                 hr_recovery=hr_recovery,
                 stride_length=stride_length,
-                rpe_score=rpe_score
+                rpe_score=rpe_score,
+                cadence_hz=cadence_hz,
+                imu_quality=imu_quality,
+                hr_quality=hr_quality
             )
         except Exception as e:
             print(f"❌ 错误分类窗口 {window_id}: {str(e)}")
@@ -107,15 +127,18 @@ class FuzzyValidationEngine:
         # 构建结果
         result = {
             'window_id': window_id,
-            'subject_id': metadata.get('subject_id', 'unknown'),
-            'task_type': metadata.get('task_type', 'unknown'),
+            'subject_id': subject_id,
+            'task_type': task_type,
             'timestamp': metadata.get('timestamp', ''),
             
-            # 原始特征
-            'hr_mean': hr_mean,
-            'step_var': step_var,
-            'hr_recovery': hr_recovery,
+            # 原始特征（IMU）
+            'cadence_hz': cadence_hz,
             'stride_length': stride_length,
+            'step_var_ms': step_var,
+            
+            # 原始特征（HR）
+            'hr_mean': hr_mean,
+            'hr_recovery': hr_recovery,
             'rpe_score': rpe_score,
             
             # 分类结果
@@ -125,6 +148,12 @@ class FuzzyValidationEngine:
             'fatigue_level_category': classification['fatigue_level'][1],
             'movement_quality_score': classification['movement_quality'][0],
             'movement_quality_category': classification['movement_quality'][1],
+            
+            # 数据质量标志
+            'imu_quality': imu_quality,
+            'hr_quality': hr_quality,
+            'imu_quality_flag': 'low' if imu_quality < 0.6 else 'high',
+            'hr_quality_flag': 'low' if hr_quality < 0.6 else 'high',
             
             # 元数据
             'confidence': classification['confidence'],
@@ -287,8 +316,8 @@ def main():
     parser.add_argument(
         '--age', '-a',
         type=int,
-        required=True,
-        help='受试者年龄（用于 MHR 计算）'
+        required=False,
+        help='受试者年龄（用于 MHR 计算。若不提供且指定了 --subject，将自动从 subject_info.csv 读取）'
     )
     
     parser.add_argument(
