@@ -25,8 +25,9 @@ warnings.filterwarnings('ignore')
 class DUOGAITProcessor:
     """Process DUO-GAIT raw data files to JSON windows"""
     
-    def __init__(self, raw_data_dir, output_dir, subject_id='sub_01'):
-        self.raw_data_dir = raw_data_dir
+    def __init__(self, imu_data_dir, hr_data_dir, output_dir, subject_id='sub_01'):
+        self.imu_data_dir = imu_data_dir    # interim: IMU data (ST.csv, LF.csv, etc)
+        self.hr_data_dir = hr_data_dir      # raw: heart_rate.CSV
         self.output_dir = output_dir
         self.subject_id = subject_id
         self.window_duration = 30  # seconds
@@ -37,10 +38,11 @@ class DUOGAITProcessor:
         
     def load_data(self):
         """Load IMU and heart rate data"""
-        print(f"Loading data from {self.raw_data_dir}...")
+        print(f"Loading IMU data from {self.imu_data_dir}...")
+        print(f"Loading HR data from {self.hr_data_dir}...")
         
-        # Load ST (gait) data - skip metadata lines (0-3)
-        st_file = os.path.join(self.raw_data_dir, 'ST.csv')
+        # Load ST (gait) data from INTERIM - skip metadata lines (0-3)
+        st_file = os.path.join(self.imu_data_dir, 'ST.csv')
         st_raw = pd.read_csv(st_file, skiprows=[0, 1, 2, 3], low_memory=False)
         
         # Extract proper column names from the first two rows (which become rows 0-1 after skiprows)
@@ -68,8 +70,8 @@ class DUOGAITProcessor:
         print(f"  ✓ Loaded ST data: {len(self.st_data)} rows")
         print(f"    Columns: {list(self.st_data.columns[:8])}")
         
-        # Load heart rate data
-        hr_file = os.path.join(self.raw_data_dir, 'heart_rate.CSV')
+        # Load heart rate data from RAW
+        hr_file = os.path.join(self.hr_data_dir, 'heart_rate.CSV')
         self.hr_data = pd.read_csv(hr_file, skiprows=[0, 1, 2], low_memory=False)
         print(f"  ✓ Loaded heart rate data: {len(self.hr_data)} rows")
         
@@ -536,14 +538,35 @@ class DUOGAITProcessor:
         return windows_created
 
 
+def get_subject_age(subject_id='sub_01'):
+    """获取受试者年龄从 subject_info.csv"""
+    try:
+        import pandas as pd
+        subject_info_path = '/Volumes/ChouSSD/elder_datasets/DUO-GAIT/raw/subject_info.csv'
+        info_df = pd.read_csv(subject_info_path)
+        
+        subject_row = info_df[info_df['sub'] == subject_id]
+        if not subject_row.empty:
+            age = subject_row['age'].values[0]
+            return int(age)
+    except:
+        pass
+    
+    return 70  # Default fallback
+
+
 def main():
     import sys
     
     # Configuration
-    raw_data_dir = '/Volumes/ChouSSD/elder_datasets/DUO-GAIT/raw/OG_st_raw/sub_01'
+    raw_data_dir = '/Volumes/ChouSSD/elder_datasets/DUO-GAIT/interim/OG_st_control/sub_01'
     output_dir = '/Volumes/ChouSSD/elder_datasets/DUO-GAIT/json/'
     subject_id = 'sub_01'
     max_windows = None  # Process all windows
+    
+    # Get subject age from info file
+    subject_age = get_subject_age(subject_id)
+    print(f"Subject age: {subject_age} years")
     
     print("=" * 70)
     print("DUO-GAIT Data Processor - JSON Window Export")
