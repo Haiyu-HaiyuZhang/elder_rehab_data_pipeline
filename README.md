@@ -1,14 +1,112 @@
-# 老年人康复运动分析系统 (Elder Rehabilitation Exercise Assessment)
+# DUO-GAIT 数据处理 Pipeline
 
-## 项目概述
+## 概述
 
-一套完整的信号处理管道，用于从可穿戴设备 (IMU + 心率监测) 中提取和分析老年人康复运动指标。
+完整的信号处理管道，用于 DUO-GAIT 数据集的处理：
+- ✅ 从 RAW 数据提取 30 秒窗口
+- ✅ 计算 5 个核心指标（步频、步幅、变异性、HR 平均、HR 最大）
+- ✅ 生成标准化 JSON 输出（供 LLM 处理）
+- ✅ Fuzzy Logic 生成 ground_truth 基准
 
-**主要功能**：
-- ✅ 步态特征提取 (步频、步长、步长变异性)
-- ✅ 心率指标计算 (平均心率、最大心率、心率恢复)
-- ✅ 数据质量评估和异常检测
-- ✅ 多源数据融合处理
+---
+
+## 📚 文档导航
+
+### 必读文档
+- **[PIPELINE_SPECIFICATION.md](PIPELINE_SPECIFICATION.md)** ⭐ （完整规范）
+  - JSON 格式、LLM 规则、Fuzzy、Q&A
+- **[METRIC_CALCULATION.md](METRIC_CALCULATION.md)** ⭐ **指标计算原理（与代码同步）**
+  - ST/LF/RF、心率对齐、五步特征、质量分、与 fuzzy 量纲说明
+- **[FILES_STRUCTURE.md](FILES_STRUCTURE.md)** 📁（项目文件说明）
+  - 项目结构、文件用途、依赖关系
+
+### 参考文档
+- **[DATA_ARCHITECTURE_GUIDE.md](DATA_ARCHITECTURE_GUIDE.md)**（数据架构详解）
+
+---
+
+## 🚀 快速开始
+
+### 前置要求
+```bash
+pip install -r signal_processing_pipeline/requirements.txt
+```
+
+### 生成 JSON 窗口
+```bash
+cd /Users/zhanghaiyu/workspace/elder_rehab
+
+# 默认处理 sub_01 st_control 数据
+python3 process_duogait_to_json.py
+
+# 某一受试者：interim 下所有 OG_* 任务各跑满 30s 窗口
+python3 run_subject_all_windows.py --subject sub_01 --out-dir /Volumes/ChouSSD/elder_datasets/DUO-GAIT/json/
+
+# 全量处理（也可以用 --dry-run 先检查数据覆盖）
+python3 batch_process_all.py \
+   --interim-base /Volumes/ChouSSD/elder_datasets/DUO-GAIT/interim \
+   --raw-base /Volumes/ChouSSD/elder_datasets/DUO-GAIT/raw \
+   --out-dir /Volumes/ChouSSD/elder_datasets/DUO-GAIT/json
+```
+
+### 配置选项
+
+编辑 `process_duogait_to_json.py` 的 `main()` 函数：
+
+```python
+def main():
+    imu_data_dir = '/Volumes/ChouSSD/elder_datasets/DUO-GAIT/interim/OG_st_control/sub_01'
+    hr_data_dir = '/Volumes/ChouSSD/elder_datasets/DUO-GAIT/raw/OG_st_raw/sub_01'
+    output_dir = '/Volumes/ChouSSD/elder_datasets/DUO-GAIT/json/'
+    subject_id = 'sub_01'
+    task_type = 'st_control'
+    max_windows = None  # None=全部，或指定数字
+
+    processor = DUOGAITProcessor(imu_data_dir, hr_data_dir, output_dir, subject_id, task_type)
+    processor.process_windows(max_windows)
+```
+
+---
+
+## 📊 输出示例
+
+**位置**：`/Volumes/ChouSSD/elder_datasets/DUO-GAIT/json/`
+
+**文件名**：`sub_01_st_control_window_0000.json`
+
+```json
+{
+  "sample_id": "000",
+  "subject_id": "sub_01",
+  "player_age": 24,
+  "dataset_source": "DUO-GAIT",
+
+  "input_features": {
+    "step_frequency_hz": 1.36,
+    "step_length_m": 1.2,
+    "step_time_variability_ms": 100.0,
+    "mean_hr_bpm": 69.8,
+    "max_hr_bpm": 71
+  },
+
+  "warmup_baseline": {
+    "warmup_cadence_hz": 1.36,
+    "warmup_stride_m": 1.2,
+    "warmup_var_ms": 100.0
+  },
+
+  "rpe": null,
+  "imu_quality": 0.95,
+  "hr_quality": 0.85,
+
+  "ground_truth": {
+    "exercise_load": "moderate",
+    "fatigue_level": "none",
+    "movement_quality": "good",
+    "composite_state": "normal"
+  }
+}
+```
 
 ---
 
@@ -16,208 +114,120 @@
 
 ```
 elder_rehab/
-├── README.md                           # 本文件
-├── .gitignore                          # Git 忽略配置
-├── input.json                          # 示例输入配置
+├── 📚 文档
+│   ├── README.md
+│   ├── PIPELINE_SPECIFICATION.md          # ⭐ 规范 + LLM/fuzzy 规则
+│   ├── METRIC_CALCULATION.md              # ⭐ 指标计算原理（自算 IMU+HR）
+│   ├── FILES_STRUCTURE.md
+│   └── DATA_ARCHITECTURE_GUIDE.md
 │
-├── signal_processing_pipeline/         # 核心处理管道
-│   ├── config.py                       # 全局配置参数
-│   ├── main.py                         # 主程序入口
-│   ├── requirements.txt                # Python 依赖
-│   │
-│   ├── modules/                        # 计算模块
-│   │   ├── step_frequency.py           # 步频计算
-│   │   ├── step_length.py              # 步长计算
-│   │   ├── step_variability.py         # 步长变异性
-│   │   ├── hr_mean.py                  # 心率指标 (QRS 检测)
-│   │   └── quality_anomaly.py          # 数据质量和异常检测
-│   │
-│   ├── utils/                          # 工具函数
-│   │   ├── dataloader.py               # 多格式数据加载
-│   │   ├── preprocessing.py            # 信号预处理 (滤波、重采样)
-│   │   └── __init__.py
-│   │
-│   ├── validate_duo_gait.py            # ⭐ DUO-GAIT 真实数据验证
-│   ├── validate_duo_gait_batch.py      # ⭐ 批量验证脚本
-│   ├── DUO_GAIT_VALIDATION_GUIDE.md    # ⭐ DUO-GAIT 使用指南
-│   │
-│   ├── validate_small_sample.py        # 合成数据验证 (逻辑验证)
-│   ├── validate_improved.py            # 改进的合成数据验证
-│   ├── VALIDATION_REPORT.md            # 验证报告
-│   ├── VALIDATION_SUMMARY.py           # 验证摘要
-│   │
-│   └── README.md                       # 模块文档
+├── 🐍 脚本
+│   ├── process_duogait_to_json.py         # ⭐ 单任务 / 默认 main
+│   ├── batch_process_all.py               # ⭐ 全量受试者和任务
+│   ├── run_subject_all_windows.py         # 单受试者全部 INTERIM 任务
+│   └── validate_duogait_metrics.py        # 可选：与 processed 离线对比
 │
-├── EXTERNAL_DRIVE_GUIDE.md             # 外挂硬盘数据访问指南
-│
-└── docs/                               # 文档 (可选)
-    └── architecture.md                 # 系统架构说明
+└── 📦 signal_processing_pipeline/
+    ├── config.py
+    ├── duogait_metrics.py                   # 双足步长融合（无 processed 输入）
+    ├── fuzzy_classifier.py                # classify_exercise_state / 同事规则
+    │
 ```
+
+**详见**：[FILES_STRUCTURE.md](FILES_STRUCTURE.md) —— 完整的文件用途和依赖关系说明
 
 ---
 
-## 🚀 快速开始
+## 🔧 核心指标说明
 
-### 1. 环境配置
+| 指标 | 单位 | 范围 | 计算方式 |
+|------|------|------|--------|
+| **step_frequency_hz** | Hz | 0.5-2.5 | 加速度峰值检测 |
+| **step_length_m** | m | 约 0.38–1.55 | 胸戴强度锚 + 可选 LF/RF 微调 + 身高/步频启发式；`STRIDE_LEN_OUTPUT_SCALE` 默认 **1.0**（老年人量纲） |
+| **step_time_variability_ms** | ms | 5–100（写入） | ST 峰间期 ISI 标准差 |
+| **mean_hr_bpm** | bpm | 30-200 | 30秒窗口平均 |
+| **max_hr_bpm** | bpm | 30-200 | 30秒窗口最大 |
+
+详见：[METRIC_CALCULATION.md](METRIC_CALCULATION.md)；规则索引：[PIPELINE_SPECIFICATION.md](PIPELINE_SPECIFICATION.md)
+
+---
+
+## 🤖 LLM 分类规则
+
+JSON 中的 `ground_truth` 字段由 Fuzzy Logic 基于以下规则生成：
+
+### 三维分类
+1. **exercise_load**: low | moderate | high | excessive
+   - 基于：mean_hr_bpm 与 %MHR（220-age）的对应关系
+
+2. **fatigue_level**: none | mild | moderate | severe
+   - 基于：step_time_variability_ms, step_length_m, RPE
+
+3. **movement_quality**: good | degraded | poor
+   - 基于：step_frequency_hz, step_length_m, step_time_variability_ms
+
+4. **composite_state**: normal | under_loaded | fatigue_risk
+   - 综合判断及安全覆盖逻辑
+
+详见：[PIPELINE_SPECIFICATION.md - LLM 分类规则](PIPELINE_SPECIFICATION.md#llm-分类规则)
+
+---
+
+## ✅ 使用流程
+
+```
+1. 准备数据
+   ├─ INTERIM CSV：6 分钟 IMU 数据 (128 Hz)
+   └─ Raw HR CSV：心率数据 (1 Hz)
+
+2. 运行 Pipeline
+   ├─ 单任务：python3 process_duogait_to_json.py
+   └─ 受试者全任务：python3 run_subject_all_windows.py --subject sub_01 --out-dir .../json/
+
+3. 获得输出
+   ├─ JSON 文件（每个 30 秒窗口）
+   └─ ground_truth（Fuzzy Logic 基准）
+
+4. 送入 LLM
+   ├─ 输入：input_features + warmup_baseline
+   └─ 对比：LLM 输出 vs ground_truth
+```
+
+## 实时协议边界
+
+仓库当前交付的是 **DUO-GAIT 离线数据处理管线**，不包含 UDP 9101/9102 的传感器接收服务。实时协议应作为独立适配层：接收端负责校验 `session_id`、`seq`、时间戳和 `quality`，再将实时特征转换为与 `input_features` 兼容的结构。离线 JSON 与实时协议中的字段不能未经定义直接混用，尤其是 `step_time_variability_ms` 与 `step_time_cv` 的单位不同。
+
+---
+
+## 🔍 验证
 
 ```bash
-# 创建 conda 环境
-conda create -n elder python=3.9
-conda activate elder
+# 验证生成的 JSON
+python3 << 'EOF'
+import json, glob
 
-# 安装依赖
-cd signal_processing_pipeline
-pip install -r requirements.txt
-```
+json_files = sorted(glob.glob('/Volumes/ChouSSD/elder_datasets/DUO-GAIT/json/sub_01_st_control*.json'))
+print(f"✅ 生成 {len(json_files)} 个 JSON 文件")
 
-### 2. 验证系统（使用真实 DUO-GAIT 数据）
+with open(json_files[0]) as f:
+    data = json.load(f)
 
-```bash
-# 单个参与者验证
-python validate_duo_gait.py
-
-# 批量验证 (前 3 个参与者)
-python validate_duo_gait_batch.py
-
-# 详细使用请见: DUO_GAIT_VALIDATION_GUIDE.md
-```
-
-### 3. 运行完整管道
-
-```bash
-python main.py --input ../input.json --output ./output/
+print(f"✅ 核心指标: {list(data['input_features'].keys())}")
+print(f"✅ Ground Truth: {list(data['ground_truth'].keys())}")
+EOF
 ```
 
 ---
 
-## 📊 支持的数据集
+## 📞 故障排查
 
-### 1. DUO-GAIT (推荐 ⭐)
-- **位置**: `/Volumes/ChouSSD/elder_datasets/DUO-GAIT/`
-- **特点**: 真实康复患者、多部位 IMU、同步心率
-- **参与者**: 18+ 人
-- **任务**: 单任务 (ST) 和双任务 (DT)
-
-### 2. GSTRIDE
-- **位置**: `/Volumes/ChouSSD/elder_datasets/GSTRIDE_database/`
-- **特点**: 标准步态数据库，IMU 传感器
-- **采样率**: 104-128 Hz
-
-### 3. PhysioNet Wearable Frailty
-- **位置**: `/Volumes/ChouSSD/elder_datasets/PhysioNet_Wearable_Frailty/`
-- **特点**: 心电图 (ECG) 数据，官方 QRS 标注
+详见：[PIPELINE_SPECIFICATION.md - 常见问题排查](PIPELINE_SPECIFICATION.md#常见问题排查)
 
 ---
 
-## 📈 验证结果
+## 版本信息
 
-### 小批量验证 (3 个参与者)
-```
-✓ 成功率: 100%
-✓ 指标一致性: A+ 优秀
-✓ 数据完整性: 100%
-
-指标范围:
-- 步频: 1.05 - 1.65 Hz (合理 ✓)
-- 步长: 0.30 - 0.47 m (合理 ✓)  
-- 平均心率: 93 - 125 bpm (合理 ✓)
-```
-
-更多详情见: [DUO_GAIT_VALIDATION_GUIDE.md](signal_processing_pipeline/DUO_GAIT_VALIDATION_GUIDE.md)
-
----
-
-## 🔧 配置
-
-编辑 `signal_processing_pipeline/config.py` 来修改参数：
-
-```python
-# 采样率
-TARGET_SAMPLE_RATE = 100
-
-# 数据路径
-EXTERNAL_DRIVE_PATH = "/Volumes/ChouSSD"
-DUO_GAIT_DATA_DIR = f"{EXTERNAL_DRIVE_PATH}/DUO-GAIT"
-
-# 算法参数
-MIN_PEAK_DISTANCE_SEC = 0.06  # 步频峰值最小间距
-PEAK_HEIGHT_MULTIPLIER = 1.0  # 峰值高度阈值
-
-# 心率范围
-HR_MIN_BPM = 30
-HR_MAX_BPM = 200
-```
-
----
-
-## 📝 当前验证状态
-
-| 模块 | 验证 | 数据源 | 状态 |
-|------|------|--------|------|
-| 步频计算 | ✅ | DUO-GAIT (3 subjects) | ✓ 优秀 |
-| 步长计算 | ✅ | DUO-GAIT (3 subjects) | ✓ 优秀 |
-| 步长变异性 | ✅ | 合成数据 | ✓ 逻辑正确 |
-| 心率计算 | ✅ | DUO-GAIT (3 subjects) | ✓ 优秀 |
-| 数据质量检测 | ✅ | DUO-GAIT | ✓ 100% 完整 |
-| 异常检测 | ✅ | 合成数据 | ✓ 正常 |
-
----
-
-## 🔗 数据访问
-
-所有数据集已迁移到外挂硬盘：
-
-```bash
-# 查看硬盘挂载
-ls /Volumes/ChouSSD/elder_datasets/
-
-# Python 访问
-import config
-print(config.DUO_GAIT_DATA_DIR)  # /Volumes/ChouSSD/elder_datasets/DUO-GAIT
-```
-
-详见: [EXTERNAL_DRIVE_GUIDE.md](EXTERNAL_DRIVE_GUIDE.md)
-
----
-
-## 📚 文档
-
-- [外挂硬盘访问指南](EXTERNAL_DRIVE_GUIDE.md) - 数据集位置和访问方法
-- [DUO-GAIT 验证指南](signal_processing_pipeline/DUO_GAIT_VALIDATION_GUIDE.md) - 数据集和结果说明
-- [验证报告](signal_processing_pipeline/VALIDATION_REPORT.md) - 详细验证结果
-- [系统架构](docs/architecture.md) - 技术架构说明
-
----
-
-## 🛠️ 依赖
-
-- Python 3.9+
-- NumPy, SciPy, Pandas
-- scikit-learn
-- wfdb (PhysioNet 数据)
-- NeuroKit2 (ECG 处理)
-
-完整列表见: [requirements.txt](signal_processing_pipeline/requirements.txt)
-
----
-
-## 📧 联系方式
-
-项目维护者: [您的名字]  
-最后更新: 2026-04-06
-
----
-
-## 📜 许可证
-
-MIT License
-
----
-
-## 🎯 后续工作
-
-- [ ] 扩展验证到所有 DUO-GAIT 参与者
-- [ ] 对比单任务 vs 双任务性能差异
-- [ ] 实现跌倒风险预测模型
-- [ ] 性能优化和并行处理
-- [ ] 医学数据库集成
+- **创建日期**：2026-04-20
+- **状态**：当前离线处理管线；运行真实数据需要本地 DUO-GAIT 数据目录
+- **主脚本**：process_duogait_to_json.py
+- **核心库**：signal_processing_pipeline/

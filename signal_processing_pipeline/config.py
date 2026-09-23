@@ -4,6 +4,8 @@
 包含采样率、窗口、步态检测参数
 """
 
+import os
+
 import numpy as np
 
 # ============================================================
@@ -48,6 +50,17 @@ STEP_FREQUENCY_MAX_HZ = 2.5
 STEP_LENGTH_MIN_M = 0.2
 STEP_LENGTH_MAX_M = 1.5
 
+# 步长估计输出缩放（默认 1.0）：与 LLM / fuzzy 规则量纲一致，按老年人干预场景标定；若实验需临时缩放可设环境变量。
+STRIDE_LEN_OUTPUT_SCALE = float(os.environ.get("ELDER_REHAB_STRIDE_SCALE", "1.0"))
+
+# 指标兜底：默认 False = 验证优先（不可靠时输出 null，无 FFT/无 1.5Hz 默认/无变异 clip 掩盖）。
+# 设环境变量 ELDER_REHAB_METRIC_FALLBACKS=1 可恢复旧行为（生产或对比实验）。
+METRIC_ALLOW_DEFAULT_FALLBACKS = os.environ.get("ELDER_REHAB_METRIC_FALLBACKS", "").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
 # ============================================================
 # 步态变异性参数
 # ============================================================
@@ -71,20 +84,6 @@ HR_MAX_BPM = 200
 
 # 加速度单位：1g = 9.81 m/s²
 G_TO_MS2 = 9.81
-
-# ============================================================
-# 数据路径配置
-# ============================================================
-
-# 外挂硬盘基础路径
-EXTERNAL_DRIVE_PATH = "/Volumes/ChouSSD/elder_datasets"
-
-# DUO-GAIT 数据集路径
-DUO_GAIT_DATA_DIR = f"{EXTERNAL_DRIVE_PATH}/DUO-GAIT"
-DUO_GAIT_RAW_DIR = f"{DUO_GAIT_DATA_DIR}/raw"
-DUO_GAIT_ST_DIR = f"{DUO_GAIT_RAW_DIR}/OG_st_raw"      # Single Task
-DUO_GAIT_DT_DIR = f"{DUO_GAIT_RAW_DIR}/OG_dt_raw"      # Dual Task
-DUO_GAIT_SUBJECT_INFO = f"{DUO_GAIT_RAW_DIR}/subject_info.csv"
 
 # 本地输出目录
 OUTPUT_DIR = "./output"

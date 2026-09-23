@@ -1,571 +1,439 @@
 """
-Mamdani Fuzzy Inference System for DUO-GAIT Exercise Classification
+与 LLM 同事规则对齐的状态分类（Dim1–3 + 安全覆盖 + composite）。
 
-三维分类系统：
-  Dim 1: Exercise Load (低/中/高/过高)
-  Dim 2: Fatigue Level (无/轻/中/重)
-  Dim 3: Movement Quality (良好/降低/差)
-
-基于模糊逻辑融合多个生理指标。
+心率缺失：有 RPE 时仅用 RPE 定运动负荷；无 RPE 时 exercise_load=unknown，
+其余维度仍可由 IMU 与规则推断；复合态不因「缺 HR」自动判 under_loaded。
 """
 
+from __future__ import annotations
+
+from typing import Any, Dict, Optional, Tuple
+
 import numpy as np
-from typing import Dict, Tuple
+
+LOAD_LEVELS = ("low", "moderate", "high", "excessive")
+FATIGUE_LEVELS = ("none", "mild", "moderate", "severe")
+QUALITY_LEVELS = ("good", "degraded", "poor")
+COMPOSITE_LEVELS = ("normal", "under_loaded", "fatigue_risk")
+
+
+def _mhr(age: int) -> float:
+    return float(220 - int(age))
+
+
+def _hr_pct(mean_hr: float, age: int) -> float:
+    m = _mhr(age)
+    if m <= 0:
+        return 0.0
+    return 100.0 * float(mean_hr) / m
+
+
+def _load_level_from_hr_pct(pct: float) -> int:
+    """<50 low；[50,70) moderate；[70,80) high；≥80 excessive（与 ceiling 规则一致）。"""
+    if pct < 50:
+        return 0
+    if pct < 70:
+        return 1
+    if pct < 80:
+        return 2
+    return 3
+
+
+def _load_level_from_rpe(rpe: float) -> int:
+    """同事表：≤3 low, 4–6 moderate, 7–8 high, ≥9 excessive（按 CR-10 数值语义）。"""
+    if rpe <= 3:
+        return 0
+    if rpe <= 6:
+        return 1
+    if rpe < 9:
+        return 2
+    return 3
+
+
+def _load_name(level: int) -> str:
+    return LOAD_LEVELS[int(np.clip(level, 0, 3))]
+
+
+def _cadence_tier(hz: float) -> int:
+    if 1.6 <= hz <= 2.0:
+        return 0
+    if (1.4 <= hz < 1.6) or (2.0 < hz <= 2.2):
+        return 1
+    if hz < 1.4 or hz > 2.2:
+        return 2
+    return 1
+
+
+def _stride_tier(m: float) -> int:
+    if 0.45 <= m <= 0.65:
+        return 0
+    if (0.35 <= m < 0.45) or (0.65 < m <= 0.75):
+        return 1
+    if m < 0.35 or m > 0.75:
+        return 2
+    return 1
+
+
+def _var_tier(ms: float) -> int:
+    if ms < 30:
+        return 0
+    if ms <= 60:
+        return 1
+    return 2
+
+
+def _apply_relative(
+    tier: int,
+    cur: float,
+    warm: float,
+    *,
+    higher_is_worse: bool,
+) -> int:
+    """±10% 内保持绝对档；恶化方向相对变化 ≥20% 升一级严重度。"""
+    if warm is None or abs(float(warm)) < 1e-9:
+        return tier
+    rel = (float(cur) - float(warm)) / abs(float(warm))
+    if abs(rel) <= 0.10:
+        return tier
+    if higher_is_worse:
+        if rel >= 0.20:
+            return int(min(2, tier + 1))
+        return tier
+    if rel <= -0.20:
+        return int(min(2, tier + 1))
+    return tier
+
+
+def _missing(x: Optional[float]) -> bool:
+    return x is None or (isinstance(x, float) and (np.isnan(x) or np.isinf(x)))
+
+
+def _dim3_score_sum(
+    cadence_hz: float,
+    stride_m: float,
+    var_ms: float,
+    warmup: Dict[str, Any],
+) -> Tuple[int, int, int]:
+    fc = _cadence_tier(cadence_hz)
+    fs = _stride_tier(stride_m)
+    fv = _var_tier(var_ms)
+
+    wc = float(warmup.get("warmup_cadence_hz") or cadence_hz)
+    ws = float(warmup.get("warmup_stride_m") or stride_m)
+    wv = float(warmup.get("warmup_var_ms") or var_ms)
+
+    fc = _apply_relative(fc, cadence_hz, wc, higher_is_worse=False)
+    fs = _apply_relative(fs, stride_m, ws, higher_is_worse=False)
+    fv = _apply_relative(fv, var_ms, wv, higher_is_worse=True)
+
+    return fc, fs, fv
+
+
+def _movement_quality_from_scores(
+    cadence_hz: float,
+    stride_m: float,
+    var_ms: float,
+    tiers: Tuple[int, int, int],
+) -> str:
+    fc, fs, fv = tiers
+    s = fc + fs + fv
+    if s <= 1:
+        base = "good"
+    elif s <= 3:
+        base = "degraded"
+    else:
+        base = "poor"
+
+    if var_ms > 80 or stride_m < 0.30:
+        return "poor"
+    if var_ms > 60 and stride_m < 0.35:
+        return "poor"
+    return base
+
+
+def _fatigue_level(
+    var_ms: Optional[float],
+    stride_m: Optional[float],
+    rpe: Optional[float],
+) -> str:
+    if _missing(var_ms):
+        return "unknown"
+    score = 0
+    if float(var_ms) > 60:
+        score += 2
+    elif float(var_ms) >= 30:
+        score += 1
+    if not _missing(stride_m) and float(stride_m) < 0.40:
+        score += 1
+    if rpe is not None:
+        rp = float(rpe)
+        if rp >= 9:
+            score += 2
+        elif rp >= 7:
+            score += 1
+    if score <= 0:
+        return "none"
+    if score <= 2:
+        return "mild"
+    if score == 3:
+        return "moderate"
+    return "severe"
+
+
+def _dim1_exercise_load(
+    mean_hr: Optional[float],
+    age: int,
+    rpe: Optional[float],
+) -> str:
+    hr_ok = mean_hr is not None and not (isinstance(mean_hr, float) and np.isnan(mean_hr))
+    if hr_ok:
+        pct = _hr_pct(float(mean_hr), age)
+        lvl = _load_level_from_hr_pct(pct)
+        if rpe is not None and not (isinstance(rpe, float) and np.isnan(rpe)):
+            r_lvl = _load_level_from_rpe(float(rpe))
+            if abs(r_lvl - lvl) >= 2:
+                lvl = max(lvl, r_lvl)
+        return _load_name(lvl)
+    if rpe is not None and not (isinstance(rpe, float) and np.isnan(rpe)):
+        return _load_name(_load_level_from_rpe(float(rpe)))
+    return "unknown"
+
+
+def _safety_override(
+    mean_hr: Optional[float],
+    age: int,
+    fatigue_level: str,
+    movement_quality: str,
+    rpe: Optional[float],
+    var_ms: Optional[float],
+    stride_m: Optional[float],
+    warmup: Dict[str, Any],
+) -> bool:
+    mhr = _mhr(age)
+    hr_ok = mean_hr is not None and not (isinstance(mean_hr, float) and np.isnan(mean_hr))
+
+    if hr_ok and float(mean_hr) >= 0.80 * mhr:
+        return True
+    if fatigue_level == "severe":
+        return True
+    if movement_quality == "poor":
+        return True
+    if rpe is not None and not (isinstance(rpe, float) and np.isnan(rpe)) and float(rpe) >= 9:
+        return True
+    if (
+        not _missing(var_ms)
+        and hr_ok
+        and float(var_ms) > 80
+        and float(mean_hr) > 0.70 * mhr
+    ):
+        return True
+
+    ws = warmup.get("warmup_stride_m")
+    if (
+        not _missing(stride_m)
+        and ws is not None
+        and float(ws) > 1e-6
+    ):
+        drop = (float(ws) - float(stride_m)) / float(ws)
+        if drop >= 0.20 and fatigue_level in ("moderate", "severe"):
+            return True
+
+    if not _missing(var_ms) and not _missing(stride_m):
+        if float(var_ms) > 60 and float(stride_m) < 0.35:
+            return True
+    return False
+
+
+def _composite_state(
+    safety: bool,
+    mean_hr: Optional[float],
+    age: int,
+    tiers: Tuple[int, int, int],
+    rpe: Optional[float],
+    imu_gait_complete: bool,
+) -> str:
+    if safety:
+        return "fatigue_risk"
+
+    fc, fs, fv = tiers
+    good_ct = sum(1 for x in (fc, fs, fv) if x == 0)
+    poor_ct = sum(1 for x in (fc, fs, fv) if x == 2)
+
+    hr_ok = mean_hr is not None and not (isinstance(mean_hr, float) and np.isnan(mean_hr))
+    pct = _hr_pct(float(mean_hr), age) if hr_ok else None
+
+    rpe_low_or_absent = rpe is None or (isinstance(rpe, float) and np.isnan(rpe)) or float(rpe) <= 3
+
+    if not imu_gait_complete:
+        return "normal"
+
+    if (
+        pct is not None
+        and pct < 50
+        and fc == 0
+        and fs == 0
+        and fv == 0
+        and rpe_low_or_absent
+    ):
+        return "under_loaded"
+
+    if pct is not None and 50 <= pct <= 70 and good_ct >= 2 and poor_ct == 0:
+        return "normal"
+
+    return "normal"
+
+
+def classify_exercise_state(
+    *,
+    mean_hr_bpm: Optional[float],
+    max_hr_bpm: Optional[float],
+    step_frequency_hz: Optional[float],
+    step_length_m: Optional[float],
+    step_time_variability_ms: Optional[float],
+    warmup_baseline: Dict[str, Any],
+    player_age: int,
+    rpe: Optional[float],
+    imu_quality: float,
+    hr_quality: float,
+) -> Dict[str, Any]:
+    """
+    返回 ground_truth 四字段 + confidence（供日志/调试，可不写入 JSON）。
+    步态任一项为 null/NaN 时：动作档 unknown；步时变异缺失则疲劳 unknown；复合态不因 IMU 缺项判 under_loaded。
+    """
+    if imu_quality < 0.6 and hr_quality < 0.6:
+        return {
+            "exercise_load": "unknown",
+            "fatigue_level": "unknown",
+            "movement_quality": "unknown",
+            "composite_state": "normal",
+            "confidence": 0.0,
+        }
+
+    warmup = warmup_baseline or {}
+    imu_gait_complete = not (
+        _missing(step_frequency_hz)
+        or _missing(step_length_m)
+        or _missing(step_time_variability_ms)
+    )
+
+    if not imu_gait_complete:
+        movement_quality = "unknown"
+        fatigue_level = _fatigue_level(
+            step_time_variability_ms, step_length_m, rpe
+        )
+        tiers = (1, 1, 1)
+    else:
+        tiers = _dim3_score_sum(
+            float(step_frequency_hz),
+            float(step_length_m),
+            float(step_time_variability_ms),
+            warmup,
+        )
+        movement_quality = _movement_quality_from_scores(
+            float(step_frequency_hz),
+            float(step_length_m),
+            float(step_time_variability_ms),
+            tiers,
+        )
+        fatigue_level = _fatigue_level(
+            step_time_variability_ms, step_length_m, rpe
+        )
+
+    exercise_load = _dim1_exercise_load(mean_hr_bpm, player_age, rpe)
+
+    safety = _safety_override(
+        mean_hr_bpm,
+        player_age,
+        fatigue_level,
+        movement_quality,
+        rpe,
+        step_time_variability_ms,
+        step_length_m,
+        warmup,
+    )
+    composite_state = _composite_state(
+        safety, mean_hr_bpm, player_age, tiers, rpe, imu_gait_complete
+    )
+
+    conf = float(min(1.0, (imu_quality + hr_quality) / 2.0))
+    if exercise_load == "unknown":
+        conf *= 0.7
+
+    return {
+        "exercise_load": exercise_load,
+        "fatigue_level": fatigue_level,
+        "movement_quality": movement_quality,
+        "composite_state": composite_state,
+        "confidence": conf,
+    }
 
 
 class FuzzyExerciseClassifier:
-    """
-    简化的 Mamdani 模糊推理系统分类器 (直接隶属度计算)
-    
-    输入 (Antecedents):
-      - hr_mean: [40, 180] bpm，基于 %MHR
-      - step_var: [10, 150] ms，步伐变异
-      - hr_recovery: [0, 50] bpm/min，恢复速率
-      - stride_length: [0.1, 1.8] m
-      - rpe_score: [6, 20] Borg Scale
-    
-    输出 (Consequents):
-      - exercise_load: [0, 4] → low(0-1), moderate(1-2), high(2-3), excessive(3-4)
-      - fatigue_level: [0, 4] → none(0-1), mild(1-2), moderate(2-3), severe(3-4)
-      - movement_quality: [0, 2] → good(0-0.67), degraded(0.67-1.33), poor(1.33-2)
-    """
-    
-    def __init__(self, age=70):
-        """
-        初始化模糊分类器
-        
-        Args:
-            age: 受试者年龄（用于计算 MHR）
-        """
-        self.age = age
-        self.mhr = 220 - age
-        # LLM 规则阈值 - IMU 绝对评分标准
-        self.llm_rules = {
-            'cadence_hz': {'good': (1.6, 2.0), 'degraded_low': (1.4, 1.6), 'degraded_high': (2.0, 2.2)},
-            'stride_m': {'good': (0.45, 0.65), 'degraded_low': (0.35, 0.45), 'degraded_high': (0.65, 0.75)},
-            'step_var_ms': {'good': 30, 'degraded': 60}
-        }
-    
-    # ============================================================
-    # 隶属度函数 (Membership Functions)
-    # ============================================================
-    
-    @staticmethod
-    def _triangular_mf(x, a, b, c):
-        """三角形隶属函数"""
-        if x <= a or x >= c:
-            return 0.0
-        elif a < x <= b:
-            return (x - a) / (b - a)
-        else:
-            return (c - x) / (c - b)
-    
-    @staticmethod
-    def _trapezoidal_mf(x, a, b, c, d):
-        """梯形隶属函数"""
-        if x <= a or x >= d:
-            return 0.0
-        elif a < x <= b:
-            return (x - a) / (b - a)
-        elif b < x < c:
-            return 1.0
-        else:
-            return (d - x) / (d - c)
-    
-    def _get_hr_membership(self, hr_mean):
-        """HR 隶属度计算"""
-        hr_low = self._trapezoidal_mf(hr_mean, 40, 40, int(0.5*self.mhr), int(0.65*self.mhr))
-        hr_moderate = self._triangular_mf(hr_mean, int(0.55*self.mhr), int(0.7*self.mhr), int(0.85*self.mhr))
-        hr_high = self._triangular_mf(hr_mean, int(0.75*self.mhr), int(0.9*self.mhr), int(1.0*self.mhr))
-        hr_excessive = self._trapezoidal_mf(hr_mean, int(0.95*self.mhr), int(1.0*self.mhr), 180, 180)
-        
-        return {
-            'low': hr_low, 'moderate': hr_moderate, 'high': hr_high, 'excessive': hr_excessive
-        }
-    
-    def _get_step_var_membership(self, step_var):
-        """步伐变异隶属度"""
-        stable = self._trapezoidal_mf(step_var, 10, 10, 20, 35)
-        unstable = self._triangular_mf(step_var, 25, 45, 65)
-        at_risk = self._trapezoidal_mf(step_var, 55, 70, 150, 150)
-        
-        return {'stable': stable, 'unstable': unstable, 'at_risk': at_risk}
-    
-    def _get_hr_recovery_membership(self, hr_recovery):
-        """心率恢复隶属度"""
-        poor = self._trapezoidal_mf(hr_recovery, 0, 0, 8, 15)
-        fair = self._triangular_mf(hr_recovery, 10, 16, 25)
-        good = self._trapezoidal_mf(hr_recovery, 20, 30, 50, 50)
-        
-        return {'poor': poor, 'fair': fair, 'good': good}
-    
-    def _get_stride_length_membership(self, stride_length):
-        """步长隶属度"""
-        short = self._trapezoidal_mf(stride_length, 0.1, 0.1, 0.35, 0.45)
-        normal = self._trapezoidal_mf(stride_length, 0.38, 0.50, 1.8, 1.8)
-        
-        return {'short': short, 'normal': normal}
-    
-    def _get_rpe_membership(self, rpe_score):
-        """RPE 隶属度"""
-        light = self._trapezoidal_mf(rpe_score, 6, 6, 7, 8)
-        moderate = self._triangular_mf(rpe_score, 7, 8.5, 10)
-        heavy = self._trapezoidal_mf(rpe_score, 9, 11, 20, 20)
-        
-        return {'light': light, 'moderate': moderate, 'heavy': heavy}
-    
-    def classify(self, hr_mean, step_var, hr_recovery, stride_length, rpe_score=12,
-                 cadence_hz=None, imu_quality=0.85, hr_quality=0.85):
-        """
-        对单个 30s 窗口进行分类（对齐 LLM 规则）
-        
-        Args:
-            hr_mean (float): 平均心率 (bpm)
-            step_var (float): 步幅变异 (ms，ISI 标准差)
-            hr_recovery (float): 心率恢复速率 (bpm/min)
-            stride_length (float): 平均步长 (m)
-            rpe_score (float): 主观感觉费力程度 (Borg 6-20)，默认 12（中等）
-            cadence_hz (float): 步频 (Hz)，用于 Dim 3 movement quality - 必需
-            imu_quality (float): IMU 数据质量 (0-1)，<0.6 时降权
-            hr_quality (float): HR 数据质量 (0-1)，<0.6 时降权
-        
-        Returns:
-            dict: {
-                'exercise_load': (value, category),
-                'fatigue_level': (value, category),
-                'movement_quality': (value, category),
-                'confidence': float (0-1, 基于输出隶属度 + 数据质量),
-                'data_quality_flags': dict (imu_quality, hr_quality)
-            }
-        """
-        
-        # 输入范围检查和裁剪
-        hr_mean = np.clip(hr_mean, 40, 180)
-        step_var = np.clip(step_var, 10, 150)
-        hr_recovery = np.clip(hr_recovery, 0, 50)
-        stride_length = np.clip(stride_length, 0.1, 1.8)
-        rpe_score = np.clip(rpe_score, 6, 20)
-        
-        # 计算输入隶属度
-        hr_mem = self._get_hr_membership(hr_mean)
-        step_mem = self._get_step_var_membership(step_var)
-        recov_mem = self._get_hr_recovery_membership(hr_recovery)
-        stride_mem = self._get_stride_length_membership(stride_length)
-        rpe_mem = self._get_rpe_membership(rpe_score)
-        
-        # ============================================================
-        # 规则评估和输出推论
-        # ============================================================
-        
-        # Dim 1: 运动负荷规则
-        load_low = hr_mem['low']
-        load_moderate = hr_mem['moderate']
-        load_high = hr_mem['high']
-        load_excessive = hr_mem['excessive']
-        
-        # RPE 冲突：高 RPE 提升负荷等级
-        if rpe_mem['heavy'] > 0.5:
-            if hr_mem['moderate'] > 0.3:
-                load_high = max(load_high, rpe_mem['heavy'] * 0.9)
-            if hr_mem['high'] > 0.3:
-                load_excessive = max(load_excessive, rpe_mem['heavy'] * 0.85)
-        
-        # 计算负荷值（0-4）
-        load_value = (
-            load_low * 0.5 +
-            load_moderate * 1.5 +
-            load_high * 3.0 +
-            load_excessive * 3.8
-        ) / (load_low + load_moderate + load_high + load_excessive + 1e-6)
-        
-        # Dim 2: 疲劳等级规则
-        fatigue_none = step_mem['stable'] * recov_mem['good']
-        fatigue_mild = (
-            (step_mem['unstable'] * recov_mem['good']) +
-            (step_mem['stable'] * recov_mem['fair'])
-        ) / 2
-        fatigue_moderate = (
-            (step_mem['unstable'] * recov_mem['fair']) +
-            (step_mem['at_risk'] * recov_mem['fair'])
-        ) / 2
-        fatigue_severe = (
-            (step_mem['at_risk'] * recov_mem['poor']) +
-            (step_mem['at_risk'] * stride_mem['short']) +
-            rpe_mem['heavy']
-        ) / 3
-        
-        # 计算疲劳值（0-4）
-        fatigue_weights = (fatigue_none + fatigue_mild + fatigue_moderate + fatigue_severe + 1e-6)
-        fatigue_value = (
-            fatigue_none * 0.5 +
-            fatigue_mild * 1.5 +
-            fatigue_moderate * 3.0 +
-            fatigue_severe * 3.8
-        ) / fatigue_weights
-        
-        # Dim 3: 动作质量规则
-        quality_good = step_mem['stable'] * stride_mem['normal']
-        quality_degraded = (
-            (step_mem['unstable'] * stride_mem['normal']) +
-            (step_mem['stable'] * stride_mem['short'])
-        ) / 2
-        quality_poor = (
-            step_mem['at_risk'] +
-            (stride_mem['short'] * step_mem['unstable'])
-        ) / 2
-        
-        # 计算质量值（0-2）
-        quality_weights = (quality_good + quality_degraded + quality_poor + 1e-6)
-        quality_value = (
-            quality_good * 0.3 +
-            quality_degraded * 1.0 +
-            quality_poor * 1.8
-        ) / quality_weights
-        
-        # 映射到分类标签
-        load_category = self._categorize_load(load_value)
-        fatigue_category = self._categorize_fatigue(fatigue_value)
-        
-        # 使用新的规则-based质量分类方法（包含 Cadence）
-        quality_category = self._categorize_quality_by_rules(
-            cadence_hz=cadence_hz if cadence_hz is not None else 1.8,
-            stride_length=stride_length,
-            step_var=step_var
+    """兼容旧接口：内部调用 classify_exercise_state。"""
+
+    def __init__(self, age: int = 70):
+        self.age = int(age)
+        self.mhr = _mhr(self.age)
+
+    def classify(
+        self,
+        hr_mean: Any,
+        step_var: float,
+        hr_recovery: Any,
+        stride_length: float,
+        rpe_score: Optional[float] = None,
+        cadence_hz: Optional[float] = None,
+        imu_quality: float = 0.85,
+        hr_quality: float = 0.85,
+        warmup_baseline: Optional[Dict[str, Any]] = None,
+        max_hr: Any = None,
+    ) -> Dict[str, Any]:
+        mean_hr = None if hr_mean is None else float(hr_mean)
+        if mean_hr is not None and np.isnan(mean_hr):
+            mean_hr = None
+        rpe = None if rpe_score is None else float(rpe_score)
+        if rpe is not None and np.isnan(rpe):
+            rpe = None
+
+        mh = max_hr
+        if mh is not None:
+            mh = float(mh)
+            if np.isnan(mh):
+                mh = None
+
+        def _fopt(x: Any) -> Optional[float]:
+            if x is None:
+                return None
+            try:
+                v = float(x)
+            except (TypeError, ValueError):
+                return None
+            if np.isnan(v) or np.isinf(v):
+                return None
+            return v
+
+        out = classify_exercise_state(
+            mean_hr_bpm=mean_hr,
+            max_hr_bpm=mh,
+            step_frequency_hz=_fopt(cadence_hz),
+            step_length_m=_fopt(stride_length),
+            step_time_variability_ms=_fopt(step_var),
+            warmup_baseline=warmup_baseline or {},
+            player_age=self.age,
+            rpe=rpe,
+            imu_quality=float(imu_quality),
+            hr_quality=float(hr_quality),
         )
-        
-        # 数据质量检查：如果两个来源都低质，标记为无效
-        if imu_quality < 0.6 and hr_quality < 0.6:
-            quality_category = 'unknown'
-            fatigue_category = 'unknown'
-            load_category = 'unknown'
-        
-        # 计算置信度（考虑数据质量）
-        confidence = self._calculate_confidence(hr_mean, step_var, imu_quality, hr_quality)
-        
+
         return {
-            'exercise_load': (load_value, load_category),
-            'fatigue_level': (fatigue_value, fatigue_category),
-            'movement_quality': (quality_value, quality_category),
-            'confidence': confidence,
-            'reasoning': self._generate_reasoning(
-                hr_mean, step_var, hr_recovery, stride_length, rpe_score
-            )
+            "exercise_load": (0.0, out["exercise_load"]),
+            "fatigue_level": (0.0, out["fatigue_level"]),
+            "movement_quality": (0.0, out["movement_quality"]),
+            "composite_state": out["composite_state"],
+            "confidence": out["confidence"],
+            "reasoning": "",
         }
-    
-    @staticmethod
-    def _categorize_load(value):
-        """将连续输出值映射到负荷分类"""
-        if value < 1.0:
-            return 'low'
-        elif value < 2.0:
-            return 'moderate'
-        elif value < 3.0:
-            return 'high'
-        else:
-            return 'excessive'
-    
-    @staticmethod
-    def _categorize_fatigue(value):
-        """将连续输出值映射到疲劳分类"""
-        if value < 1.0:
-            return 'none'
-        elif value < 2.0:
-            return 'mild'
-        elif value < 3.0:
-            return 'moderate'
-        else:
-            return 'severe'
-    
-    @staticmethod
-    def _categorize_quality(value):
-        """将连续输出值映射到质量分类（已弃用，使用新的规则）"""
-        if value < 0.67:
-            return 'good'
-        elif value < 1.33:
-            return 'degraded'
-        else:
-            return 'poor'
-    
-    def _categorize_quality_by_rules(self, cadence_hz, stride_length, step_var):
-        """
-        基于 LLM 规则的动作质量分类（Dim 3 - Movement Quality）
-        
-        LLM 规则标准：
-          Cadence (Hz):       good [1.6, 2.0] | degraded [1.4, 1.6) or (2.0, 2.2] | poor <1.4 or >2.2
-          Stride length (m):  good [0.45, 0.65] | degraded [0.35, 0.45) or (0.65, 0.75] | poor <0.35 or >0.75
-          Step-time var (ms): good <30 | degraded 30–60 | poor >60
-        
-        分类规则：
-          1. Score each IMU metric: good=0, degraded=1, poor=2
-          2. Sum ≤1 → good; sum 2–3 → degraded; sum ≥4 → poor
-          3. Extreme override: var >80ms OR stride <0.30m → poor regardless of sum
-          4. Combination override: var >60 AND stride <0.35 → poor
-        
-        Args:
-            cadence_hz: Cadence/Step frequency (Hz)
-            stride_length: Stride length (m)
-            step_var: Step time variability (ms)
-        
-        Returns:
-            quality_category: 'good' or 'degraded' or 'poor' or 'unknown'
-        """
-        # Handle missing cadence
-        if cadence_hz is None:
-            cadence_hz = 1.8  # default
-        
-        # 1. 对每个指标评分（根据 LLM 规则）
-        
-        # Cadence scoring
-        if 1.6 <= cadence_hz <= 2.0:
-            cadence_score = 0  # good
-        elif (1.4 <= cadence_hz < 1.6) or (2.0 < cadence_hz <= 2.2):
-            cadence_score = 1  # degraded
-        elif cadence_hz < 1.4 or cadence_hz > 2.2:
-            cadence_score = 2  # poor
-        else:
-            cadence_score = 1  # fallback
-        
-        # Stride length scoring
-        if 0.45 <= stride_length <= 0.65:
-            stride_score = 0  # good
-        elif (0.35 <= stride_length < 0.45) or (0.65 < stride_length <= 0.75):
-            stride_score = 1  # degraded
-        elif stride_length < 0.35 or stride_length > 0.75:
-            stride_score = 2  # poor
-        else:
-            stride_score = 1  # fallback
-        
-        # Step variability scoring (LLM: good <30, degraded 30-60, poor >60)
-        if step_var < 30:
-            var_score = 0  # good
-        elif 30 <= step_var <= 60:
-            var_score = 1  # degraded
-        else:  # >60
-            var_score = 2  # poor
-        
-        # 2. 计算求和
-        quality_sum = cadence_score + stride_score + var_score
-        
-        # 3. 应用基础规则
-        if quality_sum <= 1:
-            base_quality = 'good'
-        elif quality_sum <= 3:
-            base_quality = 'degraded'
-        else:  # ≥4
-            base_quality = 'poor'
-        
-        # 4. 极端情况 override（优先级最高）
-        if step_var > 80 or stride_length < 0.30:
-            return 'poor'
-        
-        # 5. 组合情况 override
-        if step_var > 60 and stride_length < 0.35:
-            return 'poor'
-        
-        return base_quality
-    
-    def _calculate_confidence(self, hr_mean, step_var, imu_quality=0.85, hr_quality=0.85):
-        """
-        计算分类置信度（相对于参考范围的偏离度 + 数据质量权重）
-        
-        - HR 在最优范围内 → 高置信度
-        - 步伐变异在正常范围 → 高置信度
-        - 数据质量低 → 降低置信度
-        """
-        # HR 置信度：偏离 60-80% MHR 越远，置信度越低
-        hr_optimal_low = 0.60 * self.mhr
-        hr_optimal_high = 0.80 * self.mhr
-        
-        if hr_optimal_low <= hr_mean <= hr_optimal_high:
-            hr_confidence = 1.0
-        else:
-            hr_distance = min(
-                abs(hr_mean - hr_optimal_low),
-                abs(hr_mean - hr_optimal_high)
-            )
-            hr_confidence = max(0.5, 1.0 - hr_distance / (0.3 * self.mhr))
-        
-        # 步伐置信度：<30ms 和 30-60ms 置信度高
-        if step_var < 60:
-            step_confidence = 1.0
-        else:
-            step_confidence = max(0.6, 1.0 - (step_var - 60) / 90)
-        
-        # 数据质量权重：<0.6 时严重降权
-        imu_weight = 1.0 if imu_quality >= 0.6 else 0.5
-        hr_weight = 1.0 if hr_quality >= 0.6 else 0.5
-        quality_factor = (imu_weight + hr_weight) / 2.0
-        
-        # 综合置信度（包含质量因子）
-        return ((hr_confidence + step_confidence) / 2.0) * quality_factor
-    
-    def _generate_reasoning(self, hr_mean, step_var, hr_recovery, stride_length, rpe_score):
-        """
-        生成分类决策的理由说明
-        
-        Returns:
-            str: 人类可读的推理过程
-        """
-        reasons = []
-        
-        # HR 分析
-        hr_pct = (hr_mean / self.mhr) * 100
-        if hr_pct < 50:
-            reasons.append(f"HR: {hr_mean:.0f} bpm ({hr_pct:.0f}% MHR) - 低强度")
-        elif hr_pct < 70:
-            reasons.append(f"HR: {hr_mean:.0f} bpm ({hr_pct:.0f}% MHR) - 中等强度")
-        elif hr_pct < 90:
-            reasons.append(f"HR: {hr_mean:.0f} bpm ({hr_pct:.0f}% MHR) - 高强度")
-        else:
-            reasons.append(f"HR: {hr_mean:.0f} bpm ({hr_pct:.0f}% MHR) - 过高强度 ⚠️")
-        
-        # 步伐变异分析
-        if step_var < 30:
-            reasons.append(f"Step Var: {step_var:.1f} ms - 步伐稳定")
-        elif step_var < 60:
-            reasons.append(f"Step Var: {step_var:.1f} ms - 步伐有变异")
-        else:
-            reasons.append(f"Step Var: {step_var:.1f} ms - 步伐显著变异 ⚠️")
-        
-        # 恢复速率分析
-        if hr_recovery < 12:
-            reasons.append(f"HR Recovery: {hr_recovery:.1f} bpm/min - 恢复差 ⚠️")
-        elif hr_recovery < 20:
-            reasons.append(f"HR Recovery: {hr_recovery:.1f} bpm/min - 恢复一般")
-        else:
-            reasons.append(f"HR Recovery: {hr_recovery:.1f} bpm/min - 恢复良好")
-        
-        # 步长分析
-        if stride_length < 0.40:
-            reasons.append(f"Stride: {stride_length:.2f} m - 步长短 ⚠️")
-        else:
-            reasons.append(f"Stride: {stride_length:.2f} m - 步长正常")
-        
-        # RPE 分析
-        if rpe_score < 7:
-            reasons.append(f"RPE: {rpe_score:.0f} - 感觉轻松")
-        elif rpe_score < 9:
-            reasons.append(f"RPE: {rpe_score:.0f} - 感觉适中")
-        else:
-            reasons.append(f"RPE: {rpe_score:.0f} - 感觉费力 ⚠️")
-        
-        return " | ".join(reasons)
 
 
-# ============================================================
-# 工具函数
-# ============================================================
-
-def create_classifier(age):
-    """创建新的模糊分类器"""
+def create_classifier(age: int) -> FuzzyExerciseClassifier:
     return FuzzyExerciseClassifier(age=age)
-
-
-def classify_batch(classifier, windows_data):
-    """
-    对一批 30s 窗口数据进行分类
-    
-    Args:
-        classifier: FuzzyExerciseClassifier 实例
-        windows_data (list): 每个窗口的特征字典列表
-            [
-                {
-                    'hr_mean': float,
-                    'step_var': float,
-                    'hr_recovery': float,
-                    'stride_length': float,
-                    'rpe_score': float,
-                    'timestamp': str (可选)
-                },
-                ...
-            ]
-    
-    Returns:
-        list: 分类结果列表
-            [
-                {
-                    'timestamp': str,
-                    'exercise_load': (value, category),
-                    'fatigue_level': (value, category),
-                    'movement_quality': (value, category),
-                    'confidence': float,
-                    'reasoning': str
-                },
-                ...
-            ]
-    """
-    results = []
-    
-    for window in windows_data:
-        rpe = window.get('rpe_score', 12)  # 默认中等 RPE
-        
-        result = classifier.classify(
-            hr_mean=window['hr_mean'],
-            step_var=window['step_var'],
-            hr_recovery=window['hr_recovery'],
-            stride_length=window['stride_length'],
-            rpe_score=rpe
-        )
-        
-        if 'timestamp' in window:
-            result['timestamp'] = window['timestamp']
-        
-        results.append(result)
-    
-    return results
-
-
-if __name__ == '__main__':
-    # 示例使用
-    print("="*60)
-    print("模糊逻辑分类系统 - 测试")
-    print("="*60)
-    
-    # 创建 70 岁受试者的分类器 (MHR = 150 bpm)
-    classifier = FuzzyExerciseClassifier(age=70)
-    
-    # 测试场景 1：正常步行
-    print("\n[情景 1] 正常步行")
-    result = classifier.classify(
-        hr_mean=100,      # 67% MHR，中等
-        step_var=25,      # 稳定
-        hr_recovery=18,   # 一般恢复
-        stride_length=0.55,  # 正常步长
-        rpe_score=12      # 中等费力
-    )
-    print(f"  负荷: {result['exercise_load']}")
-    print(f"  疲劳: {result['fatigue_level']}")
-    print(f"  质量: {result['movement_quality']}")
-    print(f"  置信度: {result['confidence']:.2f}")
-    print(f"  推理: {result['reasoning']}")
-    
-    # 测试场景 2：高强度 + 疲劳
-    print("\n[情景 2] 高强度 + 疲劳迹象")
-    result = classifier.classify(
-        hr_mean=135,      # 90% MHR，高度
-        step_var=75,      # 显著变异
-        hr_recovery=8,    # 恢复差
-        stride_length=0.35,  # 步长短
-        rpe_score=16      # 非常费力
-    )
-    print(f"  负荷: {result['exercise_load']}")
-    print(f"  疲劳: {result['fatigue_level']}")
-    print(f"  质量: {result['movement_quality']}")
-    print(f"  置信度: {result['confidence']:.2f}")
-    print(f"  推理: {result['reasoning']}")
-    
-    # 测试场景 3：危险 HR
-    print("\n[情景 3] HR 过高警告")
-    result = classifier.classify(
-        hr_mean=160,      # 107% MHR，过高！
-        step_var=95,      # 严重变异
-        hr_recovery=3,    # 极差恢复
-        stride_length=0.25,  # 严重缩短
-        rpe_score=18      # 极度费力
-    )
-    print(f"  负荷: {result['exercise_load']}")
-    print(f"  疲劳: {result['fatigue_level']}")
-    print(f"  质量: {result['movement_quality']}")
-    print(f"  置信度: {result['confidence']:.2f}")
-    print(f"  推理: {result['reasoning']}")
-    print(f"  ⚠️ 警告: HR 超过 {classifier.mhr} (MHR)")

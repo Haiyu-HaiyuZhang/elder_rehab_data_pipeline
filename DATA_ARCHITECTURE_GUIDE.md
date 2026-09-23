@@ -51,6 +51,7 @@ DUO-GAIT 数据集由三个关键层次组成，形成从原始数据→切分�
 │  KEY: 作为验证基准(Validation Baseline)                     │
 │       包含多项指标如步幅、步时、姿态比、节奏、速度及其CV      │
 │       用 Python 算法的输出与之对比验证准确性                │
+│       主流程 JSON **不读取**本层；仅 validate_duogait_metrics 等离线可选用 │
 │                                                               │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -72,11 +73,11 @@ DUO-GAIT 数据集由三个关键层次组成，形成从原始数据→切分�
 1. 读取 subject_info.csv 获取实验相关信息
    - visit 信息（如果可用）
    - HR baseline 和 HR fatigue 值（参考值）
-   
+
 2. 读取 raw/OG_st_raw/sub_XX/heart_rate.CSV（连续录制）
    - 查找与 subject_info 中的 HR_baseline 和 HR_fatigue 匹配的片段
    - 记录该片段的时间戳范围 [start_time, end_time]
-   
+
 3. 该时间戳范围对应的 HR 数据即为该实验的有效数据
 ```
 
@@ -152,32 +153,32 @@ print(f"时间长度: {duration_sec:.1f} 秒 = {duration_min:.2f} 分钟")
 def find_hr_segment_in_raw(raw_hr_data, interim_n_rows, sample_rate=128):
     """
     在 raw HR 数据中查找与 interim 行数对应的片段
-    
+
     Args:
         raw_hr_data: raw/OG_st_raw/sub_XX/heart_rate.CSV 数据
         interim_n_rows: interim 中对应任务的行数
         sample_rate: 128 Hz
-        
+
     Returns:
         (start_idx, end_idx): raw_hr_data 中对应的索引范围
     """
-    
+
     # interim 的时间长度（秒）
     interim_duration_sec = interim_n_rows / sample_rate
-    
+
     # 对应在 HR 数据中的行数（HR 采样率为 1 Hz）
     hr_expected_rows = int(interim_duration_sec)
-    
+
     # 在 raw_hr 中寻找匹配的连续片段
     # 可通过心率的特征（如上升-下降的动态范围）进行匹配
     for start_idx in range(len(raw_hr_data) - hr_expected_rows):
         segment = raw_hr_data[start_idx:start_idx + hr_expected_rows]
-        
+
         # 检查该段是否符合预期的运动模式
         # （心率应从低→高→低，或保持相对稳定+变化）
         if is_valid_exercise_pattern(segment):
             return start_idx, start_idx + hr_expected_rows
-    
+
     return None, None
 ```
 
@@ -221,11 +222,11 @@ def validate_against_processed(py_results, processed_csv):
     """
     对比 Python 计算结果与 processed 基准数据
     """
-    
+
     # 读取 processed 数据
     df_processed = pd.read_csv(processed_csv)
     baseline_values = df_processed.iloc[0]  # 聚合参数通常是单行
-    
+
     # 对比关键指标
     comparisons = {
         'stride_length': {
@@ -249,7 +250,7 @@ def validate_against_processed(py_results, processed_csv):
             'tolerance': 0.2  # 允许 20% 误差（CV 通常变异较大）
         }
     }
-    
+
     # 计算误差
     for metric, comparison in comparisons.items():
         error_pct = abs(comparison['py'] - comparison['baseline']) / comparison['baseline']
@@ -266,7 +267,7 @@ def validate_against_processed(py_results, processed_csv):
 每个 CSV 有以下列（来自 Physilog 5 导出）：
 
 ```
-Time(s), Accel X(m/s²), Accel Y(m/s²), Accel Z(m/s²), 
+Time(s), Accel X(m/s²), Accel Y(m/s²), Accel Z(m/s²),
 Gyro X(°/s), Gyro Y(°/s), Gyro Z(°/s),
 Quaternion W, Quaternion X, Quaternion Y, Quaternion Z,
 Pressure, Temperature
@@ -466,5 +467,5 @@ print(f"  Speed 误差: {error_speed_pct:.1f}%", "✓" if error_speed_pct < 10 e
 
 ---
 
-**最后更新**：2026-04-19  
+**最后更新**：2026-04-19
 **版本**：1.0 - 初始架构文档
