@@ -74,7 +74,6 @@ elder_rehab/
 | **README.md** | 6 KB | 项目入口，快速开始 |
 | **PIPELINE_SPECIFICATION.md** | — | 规范、JSON、LLM/fuzzy、Q&A |
 | **METRIC_CALCULATION.md** | — | **指标自算原理**（必读维护者） |
-| **PROJECT_SUMMARY.md** | — | 项目概况和里程碑 |
 | **DATA_ARCHITECTURE_GUIDE.md** | — | 数据架构参考 |
 
 ---
@@ -138,7 +137,6 @@ signal_processing_pipeline/
 ```
 README.md                          6 KB
 PIPELINE_SPECIFICATION.md         16 KB  ⭐ 完整规范
-PROJECT_SUMMARY.md               9.3 KB
 DATA_ARCHITECTURE_GUIDE.md        18 KB
 
 Total: ~49 KB
