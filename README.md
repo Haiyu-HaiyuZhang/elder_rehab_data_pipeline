@@ -17,6 +17,7 @@ RAW/heart_rate.CSV (约 1 Hz) ────┘        │
 - `process_duogait_to_json.py`：单个受试者/任务的核心处理器。
 - `batch_process_all.py`：批量处理预定义受试者和任务，可用参数筛选。
 - `run_subject_all_windows.py`：扫描某一受试者的全部 `OG_*` 任务。
+- `receive_sensor_stream.py`：监听已确定的本机 UDP IMU/HR 协议，供实时联调。
 - `validate_duogait_metrics.py`：可选地与 DUO-GAIT `processed/` 结果做离线对照，不参与 JSON 主流程。
 - `signal_processing_pipeline/config.py`：参数和环境变量配置。
 - `signal_processing_pipeline/duogait_metrics.py`：可选 LF/RF 步长修正。
@@ -130,3 +131,26 @@ python3 -m compileall -q \
 ```
 
 如果有 DUO-GAIT `processed/` 数据，可使用 `validate_duogait_metrics.py` 做参考对照；它不是主流程的单元测试，也不能替代独立的指标验证。
+
+## 实时 UDP 联调
+
+传感器进程向本机发送：
+
+- IMU 特征：`127.0.0.1:9101`，建议 5–10 Hz
+- Polar H10 心率：`127.0.0.1:9102`，建议 1 Hz
+
+启动接收端：
+
+```bash
+python3 receive_sensor_stream.py --jsonl /tmp/sensor-stream.jsonl
+```
+
+接收端严格执行已确定的协议：每帧是一个 UTF-8 JSON UDP 数据报，缺失字段必须为 `null`，`quality` 必须是 0–1，`seq` 在 session 内递增，且 IMU/HR 帧必须包含各自的全部字段。它会记录 session 切换、丢包、乱序、时间戳倒退和断流告警。
+
+`quality == 0` 且特征字段为 `null` 会被记录为未佩戴/无有效信号；完全收不到数据则会在 `--timeout-sec` 后告警，两者不会混淆。`--jsonl` 是追加式原始帧日志，用于联调复现，不应提交 Git。
+
+运行协议测试：
+
+```bash
+python3 -m unittest discover -s tests -v
+```

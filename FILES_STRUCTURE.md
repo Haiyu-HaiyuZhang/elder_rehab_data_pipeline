@@ -12,12 +12,16 @@ elder_rehab/
 ├── process_duogait_to_json.py       # 核心处理器
 ├── batch_process_all.py              # 批量处理入口
 ├── run_subject_all_windows.py        # 单受试者全任务入口
+├── receive_sensor_stream.py           # 实时 UDP 接收入口
 ├── validate_duogait_metrics.py       # 可选 processed 对照
+├── tests/
+│   └── test_realtime_protocol.py      # 协议校验测试
 └── signal_processing_pipeline/
     ├── __init__.py
     ├── config.py                     # 参数和环境变量
     ├── duogait_metrics.py            # LF/RF 步长修正和对照辅助
     ├── fuzzy_classifier.py           # ground_truth 规则基线
+    ├── realtime_protocol.py           # UDP 帧校验和流状态
     └── requirements.txt
 ```
 
@@ -51,3 +55,5 @@ elder_rehab/
 - 论文 PDF：作为研究资料单独管理，不作为运行时依赖。
 - 旧的 `modules/`、`utils/`：未被当前主流程导入，且与当前实现存在接口和导入路径偏差，已删除以避免误用。
 - 重复的 shell 批处理器和旧版批处理脚本：统一使用 `batch_process_all.py`。
+
+实时联调使用 `receive_sensor_stream.py`，协议校验测试位于 `tests/test_realtime_protocol.py`。
