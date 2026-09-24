@@ -9,8 +9,8 @@ import sys
 from pathlib import Path
 from datetime import datetime
 
-# 允许从任意工作目录运行
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+# 添加当前目录到 Python 路径
+sys.path.insert(0, '/Users/zhanghaiyu/workspace/elder_rehab')
 
 from process_duogait_to_json import DUOGAITProcessor
 
@@ -30,50 +30,50 @@ TASKS = [
     'OG_dt_sit_to_stand',
 ]
 
-# 路径配置
-BASE_INTERIM_DIR = '/Volumes/ChouSSD/elder_datasets/DUO-GAIT/interim'
-BASE_RAW_DIR = '/Volumes/ChouSSD/elder_datasets/DUO-GAIT/raw'
-OUTPUT_DIR = '/Volumes/ChouSSD/elder_datasets/DUO-GAIT/json/'
+# 默认路径仅保留兼容现有 DUO-GAIT 外接盘；正式运行建议通过命令行传入。
+DEFAULT_INTERIM_DIR = '/Volumes/ChouSSD/elder_datasets/DUO-GAIT/interim'
+DEFAULT_RAW_DIR = '/Volumes/ChouSSD/elder_datasets/DUO-GAIT/raw'
+DEFAULT_OUTPUT_DIR = '/Volumes/ChouSSD/elder_datasets/DUO-GAIT/json/'
 
 
-def get_raw_path(task_type):
+def get_raw_path(task_type, raw_base_dir):
     """根据任务类型确定 RAW 路径前缀"""
     if task_type.startswith('OG_st'):
-        return os.path.join(BASE_RAW_DIR, 'OG_st_raw')
+        return os.path.join(raw_base_dir, 'OG_st_raw')
     elif task_type.startswith('OG_dt'):
-        return os.path.join(BASE_RAW_DIR, 'OG_dt_raw')
+        return os.path.join(raw_base_dir, 'OG_dt_raw')
     else:
         return None
 
 
-def check_data_exists(subject_id, task_type):
+def check_data_exists(subject_id, task_type, interim_base_dir, raw_base_dir):
     """检查指定受试者和任务类型的数据是否存在"""
-    interim_path = os.path.join(BASE_INTERIM_DIR, task_type, subject_id, 'ST.csv')
-    raw_base = get_raw_path(task_type)
+    interim_path = os.path.join(interim_base_dir, task_type, subject_id, 'ST.csv')
+    raw_base = get_raw_path(task_type, raw_base_dir)
     raw_path = os.path.join(raw_base, subject_id, 'heart_rate.CSV')
 
     return os.path.exists(interim_path) and os.path.exists(raw_path)
 
 
-def process_subject_task(subject_id, task_type, verbose=False):
+def process_subject_task(subject_id, task_type, interim_base_dir, raw_base_dir, output_dir, verbose=False):
     """处理单个受试者的单个任务"""
 
-    raw_base = get_raw_path(task_type)
+    raw_base = get_raw_path(task_type, raw_base_dir)
     if raw_base is None:
         return False, "Invalid task type"
 
-    interim_path = os.path.join(BASE_INTERIM_DIR, task_type, subject_id)
+    interim_path = os.path.join(interim_base_dir, task_type, subject_id)
     raw_path = os.path.join(raw_base, subject_id)
 
     # 检查数据存在性
-    if not check_data_exists(subject_id, task_type):
+    if not check_data_exists(subject_id, task_type, interim_base_dir, raw_base_dir):
         return False, "Data not found"
 
     try:
         processor = DUOGAITProcessor(
             imu_data_dir=interim_path,
             hr_data_dir=raw_path,
-            output_dir=OUTPUT_DIR,
+            output_dir=output_dir,
             subject_id=subject_id,
             task_type=task_type
         )
@@ -87,8 +87,6 @@ def process_subject_task(subject_id, task_type, verbose=False):
 
 
 def main():
-    global BASE_INTERIM_DIR, BASE_RAW_DIR, OUTPUT_DIR
-
     import argparse
 
     parser = argparse.ArgumentParser(description='批量处理 DUO-GAIT 数据集')
@@ -97,31 +95,16 @@ def main():
     parser.add_argument('--tasks', nargs='+', help='指定任务，e.g. OG_st_control OG_st_fatigue')
     parser.add_argument('--skip-existing', action='store_true', help='跳过已存在的输出')
     parser.add_argument('--verbose', action='store_true', help='详细输出')
-    parser.add_argument(
-        '--interim-base',
-        default=BASE_INTERIM_DIR,
-        help='INTERIM 数据根目录',
-    )
-    parser.add_argument(
-        '--raw-base',
-        default=BASE_RAW_DIR,
-        help='RAW 数据根目录',
-    )
-    parser.add_argument(
-        '--out-dir',
-        default=OUTPUT_DIR,
-        help='JSON 输出目录',
-    )
+    parser.add_argument('--interim-base', default=DEFAULT_INTERIM_DIR, help='DUO-GAIT interim 目录')
+    parser.add_argument('--raw-base', default=DEFAULT_RAW_DIR, help='DUO-GAIT raw 目录')
+    parser.add_argument('--out-dir', default=DEFAULT_OUTPUT_DIR, help='JSON 输出目录')
 
     args = parser.parse_args()
-
-    BASE_INTERIM_DIR = args.interim_base
-    BASE_RAW_DIR = args.raw_base
-    OUTPUT_DIR = args.out_dir
 
     # 确定要处理的受试者和任务
     subjects = args.subjects if args.subjects else SUBJECTS
     tasks = args.tasks if args.tasks else TASKS
+    output_dir = args.out_dir
 
     # 统计信息
     total_combos = len(subjects) * len(tasks)
@@ -136,7 +119,7 @@ def main():
     print()
 
     # 创建输出目录
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
 
     # 处理统计
     success_count = 0
@@ -154,14 +137,14 @@ def main():
         for sub_idx, subject_id in enumerate(subjects, 1):
             # 检查是否应该跳过
             if args.skip_existing:
-                sample_output = os.path.join(OUTPUT_DIR, f"{subject_id}_{task_type}_window_0000.json")
+                sample_output = os.path.join(output_dir, f"{subject_id}_{task_type}_window_0000.json")
                 if os.path.exists(sample_output):
                     print(f"  [{sub_idx:2d}/{sub_total}] {subject_id:<8} - ⊘ 跳过（已存在）", flush=True)
                     skip_count += 1
                     continue
 
             # 检查数据是否存在
-            if not check_data_exists(subject_id, task_type):
+            if not check_data_exists(subject_id, task_type, args.interim_base, args.raw_base):
                 print(f"  [{sub_idx:2d}/{sub_total}] {subject_id:<8} - ⊘ 数据不存在", flush=True)
                 skip_count += 1
                 continue
@@ -171,7 +154,14 @@ def main():
                 print(f"  [{sub_idx:2d}/{sub_total}] {subject_id:<8} - ▶ DRY RUN", flush=True)
                 success_count += 1
             else:
-                success, msg = process_subject_task(subject_id, task_type, args.verbose)
+                success, msg = process_subject_task(
+                    subject_id,
+                    task_type,
+                    args.interim_base,
+                    args.raw_base,
+                    output_dir,
+                    args.verbose,
+                )
 
                 if success:
                     print(f"  [{sub_idx:2d}/{sub_total}] {subject_id:<8} - ✓ {msg}", flush=True)
@@ -197,9 +187,9 @@ def main():
         print()
 
     # 输出统计
-    json_dir = Path(OUTPUT_DIR)
+    json_dir = Path(output_dir)
     json_files = list(json_dir.glob('*.json'))
-    print(f"输出目录: {OUTPUT_DIR}")
+    print(f"输出目录: {output_dir}")
     print(f"总 JSON 文件数: {len(json_files)}")
     print()
 

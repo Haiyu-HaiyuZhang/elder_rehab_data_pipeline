@@ -525,6 +525,6 @@ MIN_PEAK_DISTANCE_SEC = 0.4   # 最小步间距（秒）
 - **Pipeline 版本**：1.0
 - **核心库**：signal_processing_pipeline/
 - **主脚本**：process_duogait_to_json.py
-- **状态**：当前离线处理规范；真实数据运行需要本地 DUO-GAIT 数据目录
+- **状态**：生产就绪 ✅
 
 ---

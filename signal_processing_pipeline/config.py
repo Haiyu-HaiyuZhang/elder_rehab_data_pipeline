@@ -6,8 +6,6 @@
 
 import os
 
-import numpy as np
-
 # ============================================================
 # 采样率与时间窗口配置
 # ============================================================
@@ -84,6 +82,20 @@ HR_MAX_BPM = 200
 
 # 加速度单位：1g = 9.81 m/s²
 G_TO_MS2 = 9.81
+
+# ============================================================
+# 数据路径配置
+# ============================================================
+
+# 外挂硬盘基础路径
+EXTERNAL_DRIVE_PATH = "/Volumes/ChouSSD/elder_datasets"
+
+# DUO-GAIT 数据集路径
+DUO_GAIT_DATA_DIR = f"{EXTERNAL_DRIVE_PATH}/DUO-GAIT"
+DUO_GAIT_RAW_DIR = f"{DUO_GAIT_DATA_DIR}/raw"
+DUO_GAIT_ST_DIR = f"{DUO_GAIT_RAW_DIR}/OG_st_raw"      # Single Task
+DUO_GAIT_DT_DIR = f"{DUO_GAIT_RAW_DIR}/OG_dt_raw"      # Dual Task
+DUO_GAIT_SUBJECT_INFO = f"{DUO_GAIT_RAW_DIR}/subject_info.csv"
 
 # 本地输出目录
 OUTPUT_DIR = "./output"
