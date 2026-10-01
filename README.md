@@ -96,14 +96,12 @@ python3 run_subject_all_windows.py \
 
 ## 规则基线
 
-`ground_truth` 由 `fuzzy_classifier.py` 生成，包含：
+`ground_truth` 由 `fuzzy_classifier.py` 生成，并按交接 prompt 分为：
 
-- `exercise_load`
-- `fatigue_level`
-- `movement_quality`
-- `composite_state`
+- `research_layer`：`exercise_load_state`、`fatigue_level`、`movement_quality`、`composite_state`、置信度、模态贡献、原因、补偿 flags 与数据可靠性。
+- `system_layer`：`dda_delta`、`ui_feedback` 与 `clinical_flag`。
 
-它是项目内的可重复规则基线，不等同于临床金标准。缺失或质量不足时输出 `null`/`unknown`，不会把缺失值默认为 0。
+它是项目内的可重复规则基线，不等同于临床金标准。缺失或质量不足时输出 `null`/`unknown`；双模态低质量或分类异常输出 `data_invalid`，不会把缺失值默认为 0 或默认成正常状态。
 
 ## 配置
 
@@ -149,8 +147,35 @@ python3 receive_sensor_stream.py --jsonl /tmp/sensor-stream.jsonl
 
 `quality == 0` 且特征字段为 `null` 会被记录为未佩戴/无有效信号；完全收不到数据则会在 `--timeout-sec` 后告警，两者不会混淆。`--jsonl` 是追加式原始帧日志，用于联调复现，不应提交 Git。
 
+### 当前实时评估边界
+
+- 实时 IMU 协议发送的是无量纲比例 `step_time_cv = SD(step_time) / mean(step_time)`；离线 assessment 分类器接收的是 `step_time_variability_ms = SD(step_time) × 1000`，其 30/60/80 阈值单位为毫秒。当前没有完成经过确认的 CV→毫秒标准差适配，禁止把 `step_time_cv` 直接传给 `assess_exercise_state()`。
+- `receive_sensor_stream.py` 当前只负责校验、状态跟踪和可选 JSONL 记录。它尚未把实时 IMU/HR 帧按评估窗口聚合成离线 schema，也没有调用 `assess_exercise_state()`；因此当前实时链路输出的是稳定传感器特征流，不是实时 assessment 结果。
+
+后续实时 assessment 应放在单独的 live adapter 中：先明确窗口、时间对齐和 CV/毫秒接口契约，再调用纯函数分类器，不能在 UDP receiver 中静默套用错误量纲。
+
 运行协议测试：
 
 ```bash
 python3 -m unittest discover -s tests -v
 ```
+
+## Windows Sensor Bridge
+
+`SensorBridge/` 是独立的 .NET 8 Windows x64 程序，负责连接 WIT BWT901 BLE 5.0 系列 IMU 和 Polar H10，并持续发布上述两路 UDP。它与 Unity 解耦，设备断开或数据 stale 时仍按固定频率发送 `quality: 0` 且传感器字段全部为 `null`。
+
+无硬件联调：
+
+```powershell
+dotnet run --project .\SensorBridge\src\SensorBridge\SensorBridge.csproj -- --simulate
+```
+
+发布：
+
+```powershell
+.\SensorBridge\publish-win-x64.ps1
+```
+
+配置、硬件说明和 Windows 验收步骤见 [SensorBridge/README.md](SensorBridge/README.md)。
+
+离线 `ground_truth` 已对齐交接文档中的两层 assessment prompt，输出 `research_layer` 与 `system_layer`；旧 Python 分类器接口仍保留兼容包装。

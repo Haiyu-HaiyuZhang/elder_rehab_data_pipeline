@@ -49,7 +49,7 @@ _PIPELINE_ROOT = Path(__file__).resolve().parent / "signal_processing_pipeline"
 sys.path.insert(0, str(_PIPELINE_ROOT))
 import config as _proc_config
 from duogait_metrics import stride_from_cadence_height_and_feet
-from fuzzy_classifier import FuzzyExerciseClassifier
+from fuzzy_classifier import assess_exercise_state
 
 
 def _metric_fallbacks_enabled() -> bool:
@@ -614,18 +614,15 @@ class DUOGAITProcessor:
             """Convert numpy types to Python native types for JSON serialization"""
             if value is None:
                 return None
+            if isinstance(value, (float, np.floating)) and np.isnan(value):
+                return None
             if isinstance(value, (np.integer, np.int64)):
                 return int(value)
             elif isinstance(value, (np.floating, np.float64)):
                 return float(value)
             elif isinstance(value, np.ndarray):
                 return value.tolist()
-            elif isinstance(value, (float, np.floating)) and np.isnan(value):
-                return None
             return value
-
-        # Initialize fuzzy classifier for ground_truth（与同事 LLM 规则对齐）
-        classifier = FuzzyExerciseClassifier(age=player_age)
 
         raw_hr_mean = hr_features.get("hr_mean_bpm")
         if raw_hr_mean is None or (isinstance(raw_hr_mean, float) and np.isnan(raw_hr_mean)):
@@ -655,32 +652,48 @@ class DUOGAITProcessor:
         else:
             max_hr = float(raw_hr_max)
 
+        def _invalid_assessment(reason):
+            return {
+                "research_layer": {
+                    "exercise_load_state": "unknown",
+                    "fatigue_level": "unknown",
+                    "movement_quality": "unknown",
+                    "composite_state": "unknown",
+                    "confidence": 0.0,
+                    "modality_contribution": {
+                        "imu_weight": 0.0,
+                        "hr_weight": 0.0,
+                    },
+                    "reasoning": reason,
+                    "compensation_flags": ["data_invalid"],
+                    "data_reliability": "low",
+                },
+                "system_layer": {
+                    "dda_delta": 0,
+                    "ui_feedback": "Sensor data quality is too low for a reliable assessment.",
+                    "clinical_flag": "data_invalid",
+                },
+            }
+
         try:
-            fuzzy_result = classifier.classify(
-                hr_mean=mean_hr,
-                step_var=step_var,
-                hr_recovery=None,
-                stride_length=stride_length,
-                rpe_score=rpe_value,
-                cadence_hz=step_freq,
-                imu_quality=imu_quality,
-                hr_quality=hr_quality,
+            ground_truth = assess_exercise_state(
+                mean_hr_bpm=mean_hr,
+                max_hr_bpm=max_hr,
+                step_frequency_hz=step_freq,
+                step_length_m=stride_length,
+                step_time_variability_ms=step_var,
                 warmup_baseline=warmup_baseline or {},
-                max_hr=max_hr,
+                player_age=player_age,
+                rpe=rpe_value,
+                imu_quality=float(imu_quality),
+                hr_quality=float(hr_quality),
             )
 
-            exercise_load = fuzzy_result["exercise_load"][1]
-            fatigue_level = fuzzy_result["fatigue_level"][1]
-            movement_quality = fuzzy_result["movement_quality"][1]
-            composite_state = fuzzy_result["composite_state"]
-
         except Exception as e:
-            # Fallback if fuzzy logic fails
             print(f"    ⚠ Fuzzy classifier error for window {window_idx}: {e}")
-            exercise_load = 'moderate'
-            fatigue_level = 'none'
-            movement_quality = 'good'
-            composite_state = 'normal'
+            ground_truth = _invalid_assessment(
+                f"Assessment failed for this window: {type(e).__name__}."
+            )
 
         window_json = {
             "sample_id": f"{window_idx:03d}",
@@ -698,12 +711,7 @@ class DUOGAITProcessor:
             "rpe": to_serializable(rpe_value),
             "imu_quality": to_serializable(imu_quality),
             "hr_quality": to_serializable(hr_quality),
-            "ground_truth": {
-                "exercise_load": exercise_load,
-                "fatigue_level": fatigue_level,
-                "movement_quality": movement_quality,
-                "composite_state": composite_state
-            }
+            "ground_truth": ground_truth,
         }
 
         return window_json

@@ -7,7 +7,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -15,6 +15,30 @@ LOAD_LEVELS = ("low", "moderate", "high", "excessive")
 FATIGUE_LEVELS = ("none", "mild", "moderate", "severe")
 QUALITY_LEVELS = ("good", "degraded", "poor")
 COMPOSITE_LEVELS = ("normal", "under_loaded", "fatigue_risk")
+
+
+def _unknown_assessment(reason: str = "Both IMU and heart-rate data are below the usable quality threshold.") -> Dict[str, Any]:
+    return {
+        "research_layer": {
+            "exercise_load_state": "unknown",
+            "fatigue_level": "unknown",
+            "movement_quality": "unknown",
+            "composite_state": "unknown",
+            "confidence": 0.0,
+            "modality_contribution": {
+                "imu_weight": 0.0,
+                "hr_weight": 0.0,
+            },
+            "reasoning": reason,
+            "compensation_flags": ["data_invalid"],
+            "data_reliability": "low",
+        },
+        "system_layer": {
+            "dda_delta": 0,
+            "ui_feedback": "Sensor data quality is too low for a reliable assessment.",
+            "clinical_flag": "data_invalid",
+        },
+    }
 
 
 def _mhr(age: int) -> float:
@@ -194,8 +218,9 @@ def _dim1_exercise_load(
             if abs(r_lvl - lvl) >= 2:
                 lvl = max(lvl, r_lvl)
         return _load_name(lvl)
-    if rpe is not None and not (isinstance(rpe, float) and np.isnan(rpe)):
-        return _load_name(_load_level_from_rpe(float(rpe)))
+    # The frozen prompt requires HR-dependent exercise load to remain unknown
+    # when mean HR is unavailable. RPE can still affect fatigue and safety, but
+    # it must not be used to invent an HR load state.
     return "unknown"
 
 
@@ -209,24 +234,49 @@ def _safety_override(
     stride_m: Optional[float],
     warmup: Dict[str, Any],
 ) -> bool:
+    return bool(
+        _safety_flags(
+            mean_hr,
+            age,
+            fatigue_level,
+            movement_quality,
+            rpe,
+            var_ms,
+            stride_m,
+            warmup,
+        )
+    )
+
+
+def _safety_flags(
+    mean_hr: Optional[float],
+    age: int,
+    fatigue_level: str,
+    movement_quality: str,
+    rpe: Optional[float],
+    var_ms: Optional[float],
+    stride_m: Optional[float],
+    warmup: Dict[str, Any],
+) -> List[str]:
     mhr = _mhr(age)
     hr_ok = mean_hr is not None and not (isinstance(mean_hr, float) and np.isnan(mean_hr))
+    flags: List[str] = []
 
     if hr_ok and float(mean_hr) >= 0.80 * mhr:
-        return True
+        flags.append("high_cardiac_load")
     if fatigue_level == "severe":
-        return True
+        flags.append("severe_fatigue")
     if movement_quality == "poor":
-        return True
+        flags.append("poor_movement_quality")
     if rpe is not None and not (isinstance(rpe, float) and np.isnan(rpe)) and float(rpe) >= 9:
-        return True
+        flags.append("high_rpe")
     if (
         not _missing(var_ms)
         and hr_ok
         and float(var_ms) > 80
         and float(mean_hr) > 0.70 * mhr
     ):
-        return True
+        flags.append("high_variability_high_hr")
 
     ws = warmup.get("warmup_stride_m")
     if (
@@ -236,12 +286,12 @@ def _safety_override(
     ):
         drop = (float(ws) - float(stride_m)) / float(ws)
         if drop >= 0.20 and fatigue_level in ("moderate", "severe"):
-            return True
+            flags.append("stride_drop_fatigue")
 
     if not _missing(var_ms) and not _missing(stride_m):
         if float(var_ms) > 60 and float(stride_m) < 0.35:
-            return True
-    return False
+            flags.append("variability_short_stride")
+    return flags
 
 
 def _composite_state(
@@ -283,6 +333,223 @@ def _composite_state(
     return "normal"
 
 
+def _modality_contribution(
+    *,
+    imu_quality: float,
+    hr_quality: float,
+    imu_gait_complete: bool,
+    mean_hr_bpm: Optional[float],
+) -> Dict[str, float]:
+    imu_available = imu_gait_complete and imu_quality >= 0.6
+    hr_available = (not _missing(mean_hr_bpm)) and hr_quality >= 0.6
+
+    if not imu_available and not hr_available:
+        return {"imu_weight": 0.0, "hr_weight": 0.0}
+    if imu_available and not hr_available:
+        return {"imu_weight": 0.9, "hr_weight": 0.1}
+    if hr_available and not imu_available:
+        return {"imu_weight": 0.1, "hr_weight": 0.9}
+
+    imu = max(0.0, min(1.0, float(imu_quality)))
+    hr = max(0.0, min(1.0, float(hr_quality)))
+    total = imu + hr
+    if total <= 0:
+        return {"imu_weight": 0.5, "hr_weight": 0.5}
+    return {
+        "imu_weight": round(imu / total, 3),
+        "hr_weight": round(hr / total, 3),
+    }
+
+
+def _data_reliability(
+    *,
+    imu_quality: float,
+    hr_quality: float,
+    imu_gait_complete: bool,
+    mean_hr_bpm: Optional[float],
+) -> str:
+    hr_complete = not _missing(mean_hr_bpm)
+    if imu_quality < 0.6 and hr_quality < 0.6:
+        return "low"
+    if imu_gait_complete and hr_complete and imu_quality >= 0.8 and hr_quality >= 0.8:
+        return "high"
+    if (imu_gait_complete and imu_quality >= 0.6) or (hr_complete and hr_quality >= 0.6):
+        return "medium"
+    return "low"
+
+
+def _clinical_flag(flags: List[str], composite_state: str) -> str:
+    if not flags:
+        return "normal"
+    if "high_rpe" in flags or "high_variability_high_hr" in flags:
+        return "hard_stop"
+    if "high_cardiac_load" in flags:
+        return "high_cardiac_load"
+    if "stride_drop_fatigue" in flags or "variability_short_stride" in flags:
+        return "fatigue_compensation"
+    if composite_state == "fatigue_risk":
+        return "hard_stop"
+    return "normal"
+
+
+def _dda_delta(composite_state: str, clinical_flag: str) -> int:
+    if clinical_flag in ("hard_stop", "high_cardiac_load"):
+        return -2
+    if composite_state == "fatigue_risk":
+        return -2
+    if clinical_flag == "fatigue_compensation":
+        return -1
+    if composite_state == "under_loaded":
+        return 1
+    return 0
+
+
+def _reasoning(
+    *,
+    exercise_load: str,
+    fatigue_level: str,
+    movement_quality: str,
+    composite_state: str,
+    flags: List[str],
+    mean_hr_bpm: Optional[float],
+    imu_gait_complete: bool,
+) -> str:
+    parts = [
+        f"Exercise load is {exercise_load}.",
+        f"Fatigue level is {fatigue_level}.",
+        f"Movement quality is {movement_quality}.",
+        f"Composite state is {composite_state}.",
+    ]
+    if _missing(mean_hr_bpm):
+        parts.append("Heart-rate input is unavailable, so HR safety rules were not applied.")
+    if not imu_gait_complete:
+        parts.append("IMU gait inputs are incomplete, so movement quality is unknown.")
+    if flags:
+        parts.append("Safety flags: " + ", ".join(flags) + ".")
+    return " ".join(parts)
+
+
+def _ui_feedback(composite_state: str, clinical_flag: str) -> str:
+    if clinical_flag == "data_invalid":
+        return "Sensor data quality is too low for a reliable assessment."
+    if clinical_flag == "hard_stop":
+        return "Pause or reduce intensity and reassess before continuing."
+    if clinical_flag == "high_cardiac_load":
+        return "Heart-rate load is high; reduce intensity and monitor closely."
+    if clinical_flag == "fatigue_compensation":
+        return "Movement compensation is detected; reduce task difficulty."
+    if composite_state == "under_loaded":
+        return "Current load appears low; a small difficulty increase can be considered."
+    return "Current state is within the expected training range."
+
+
+def assess_exercise_state(
+    *,
+    mean_hr_bpm: Optional[float],
+    max_hr_bpm: Optional[float],
+    step_frequency_hz: Optional[float],
+    step_length_m: Optional[float],
+    step_time_variability_ms: Optional[float],
+    warmup_baseline: Dict[str, Any],
+    player_age: int,
+    rpe: Optional[float],
+    imu_quality: float,
+    hr_quality: float,
+) -> Dict[str, Any]:
+    """Return the colleague prompt's two-layer assessment schema."""
+    if imu_quality < 0.6 and hr_quality < 0.6:
+        return _unknown_assessment()
+
+    warmup = warmup_baseline or {}
+    imu_gait_complete = not (
+        _missing(step_frequency_hz)
+        or _missing(step_length_m)
+        or _missing(step_time_variability_ms)
+    )
+
+    if not imu_gait_complete:
+        movement_quality = "unknown"
+        fatigue_level = _fatigue_level(step_time_variability_ms, step_length_m, rpe)
+        tiers = (1, 1, 1)
+    else:
+        tiers = _dim3_score_sum(
+            float(step_frequency_hz),
+            float(step_length_m),
+            float(step_time_variability_ms),
+            warmup,
+        )
+        movement_quality = _movement_quality_from_scores(
+            float(step_frequency_hz),
+            float(step_length_m),
+            float(step_time_variability_ms),
+            tiers,
+        )
+        fatigue_level = _fatigue_level(step_time_variability_ms, step_length_m, rpe)
+
+    exercise_load = _dim1_exercise_load(mean_hr_bpm, player_age, rpe)
+    flags = _safety_flags(
+        mean_hr_bpm,
+        player_age,
+        fatigue_level,
+        movement_quality,
+        rpe,
+        step_time_variability_ms,
+        step_length_m,
+        warmup,
+    )
+    composite_state = _composite_state(
+        bool(flags), mean_hr_bpm, player_age, tiers, rpe, imu_gait_complete
+    )
+
+    contribution = _modality_contribution(
+        imu_quality=imu_quality,
+        hr_quality=hr_quality,
+        imu_gait_complete=imu_gait_complete,
+        mean_hr_bpm=mean_hr_bpm,
+    )
+    reliability = _data_reliability(
+        imu_quality=imu_quality,
+        hr_quality=hr_quality,
+        imu_gait_complete=imu_gait_complete,
+        mean_hr_bpm=mean_hr_bpm,
+    )
+    conf = float(min(1.0, max(0.0, (imu_quality + hr_quality) / 2.0)))
+    if exercise_load == "unknown":
+        conf *= 0.7
+    if reliability == "low":
+        conf *= 0.5
+
+    clinical_flag = _clinical_flag(flags, composite_state)
+    dda_delta = _dda_delta(composite_state, clinical_flag)
+
+    return {
+        "research_layer": {
+            "exercise_load_state": exercise_load,
+            "fatigue_level": fatigue_level,
+            "movement_quality": movement_quality,
+            "composite_state": composite_state,
+            "confidence": conf,
+            "modality_contribution": contribution,
+            "reasoning": _reasoning(
+                exercise_load=exercise_load,
+                fatigue_level=fatigue_level,
+                movement_quality=movement_quality,
+                composite_state=composite_state,
+                flags=flags,
+                mean_hr_bpm=mean_hr_bpm,
+                imu_gait_complete=imu_gait_complete,
+            ),
+            "compensation_flags": flags,
+            "data_reliability": reliability,
+        },
+        "system_layer": {
+            "dda_delta": dda_delta,
+            "ui_feedback": _ui_feedback(composite_state, clinical_flag),
+            "clinical_flag": clinical_flag,
+        },
+    }
+
+
 def classify_exercise_state(
     *,
     mean_hr_bpm: Optional[float],
@@ -300,71 +567,26 @@ def classify_exercise_state(
     返回 ground_truth 四字段 + confidence（供日志/调试，可不写入 JSON）。
     步态任一项为 null/NaN 时：动作档 unknown；步时变异缺失则疲劳 unknown；复合态不因 IMU 缺项判 under_loaded。
     """
-    if imu_quality < 0.6 and hr_quality < 0.6:
-        return {
-            "exercise_load": "unknown",
-            "fatigue_level": "unknown",
-            "movement_quality": "unknown",
-            "composite_state": "normal",
-            "confidence": 0.0,
-        }
-
-    warmup = warmup_baseline or {}
-    imu_gait_complete = not (
-        _missing(step_frequency_hz)
-        or _missing(step_length_m)
-        or _missing(step_time_variability_ms)
+    assessment = assess_exercise_state(
+        mean_hr_bpm=mean_hr_bpm,
+        max_hr_bpm=max_hr_bpm,
+        step_frequency_hz=step_frequency_hz,
+        step_length_m=step_length_m,
+        step_time_variability_ms=step_time_variability_ms,
+        warmup_baseline=warmup_baseline,
+        player_age=player_age,
+        rpe=rpe,
+        imu_quality=imu_quality,
+        hr_quality=hr_quality,
     )
-
-    if not imu_gait_complete:
-        movement_quality = "unknown"
-        fatigue_level = _fatigue_level(
-            step_time_variability_ms, step_length_m, rpe
-        )
-        tiers = (1, 1, 1)
-    else:
-        tiers = _dim3_score_sum(
-            float(step_frequency_hz),
-            float(step_length_m),
-            float(step_time_variability_ms),
-            warmup,
-        )
-        movement_quality = _movement_quality_from_scores(
-            float(step_frequency_hz),
-            float(step_length_m),
-            float(step_time_variability_ms),
-            tiers,
-        )
-        fatigue_level = _fatigue_level(
-            step_time_variability_ms, step_length_m, rpe
-        )
-
-    exercise_load = _dim1_exercise_load(mean_hr_bpm, player_age, rpe)
-
-    safety = _safety_override(
-        mean_hr_bpm,
-        player_age,
-        fatigue_level,
-        movement_quality,
-        rpe,
-        step_time_variability_ms,
-        step_length_m,
-        warmup,
-    )
-    composite_state = _composite_state(
-        safety, mean_hr_bpm, player_age, tiers, rpe, imu_gait_complete
-    )
-
-    conf = float(min(1.0, (imu_quality + hr_quality) / 2.0))
-    if exercise_load == "unknown":
-        conf *= 0.7
+    research = assessment["research_layer"]
 
     return {
-        "exercise_load": exercise_load,
-        "fatigue_level": fatigue_level,
-        "movement_quality": movement_quality,
-        "composite_state": composite_state,
-        "confidence": conf,
+        "exercise_load": research["exercise_load_state"],
+        "fatigue_level": research["fatigue_level"],
+        "movement_quality": research["movement_quality"],
+        "composite_state": research["composite_state"],
+        "confidence": research["confidence"],
     }
 
 
